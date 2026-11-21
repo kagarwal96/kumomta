@@ -146,6 +146,10 @@ end)
 kumo.on('smtp_server_message_received', function(msg)
   local sender = msg:sender().user
   if utils.starts_with(sender, 'disconnect-in-data-no-421') then
+    local delay = os.getenv 'KUMOD_TEST_SINK_DATA_DOT_DELAY'
+    if delay then
+      kumo.time.sleep(tonumber(delay))
+    end
     kumo.disconnect(451, 'disconnecting ' .. sender, 'ForceDisconnect')
   end
 

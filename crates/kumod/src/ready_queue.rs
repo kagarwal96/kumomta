@@ -9,7 +9,9 @@ use crate::http_server::admin_suspend_ready_q_v1::{
 use crate::http_server::admin_suspend_v1::AdminSuspendEntry;
 use crate::http_server::inject_v1::HttpInjectionGeneratorDispatcher;
 use crate::http_server::queue_name_multi_index::CachedEntry;
-use crate::logging::disposition::{log_disposition, LogDisposition, RecordType};
+use crate::logging::disposition::{
+    log_disposition, log_smtp_disposition, LogDisposition, RecordType,
+};
 use crate::lua_deliver::LuaQueueDispatcher;
 use crate::metrics_helper::TOTAL_READYQ_RUNS;
 use crate::queue::{
@@ -321,7 +323,7 @@ impl ReadyQueueManager {
         let site_name = match &queue_config.borrow().protocol {
             DeliveryProto::Smtp { smtp } => {
                 if smtp.mx_list.is_empty() {
-                    mx.replace(MailExchanger::resolve(routing_domain).await?);
+                    mx.replace(crate::smtp_dispatcher::resolve_smtp_mx(routing_domain).await?);
                     mx.as_ref().unwrap().site_name.to_string()
                 } else {
                     let mut mx_list = vec![];
@@ -1754,6 +1756,9 @@ pub struct Dispatcher {
     pub delivery_protocol: String,
     pub suspended: Option<AdminSuspendReadyQEntryRef>,
     pub session_id: Uuid,
+    /// Retain the wire result through per-recipient policy and spool operations.
+    /// An internal error after MAIL FROM still belongs to that transaction.
+    pub(crate) smtp_transaction: Option<Box<crate::smtp_dispatcher::Transaction>>,
     leases: Vec<LimitLease>,
     batch_started: Option<tokio::time::Instant>,
     pub states: Arc<FairMutex<ReadyQueueStates>>,
@@ -1922,6 +1927,7 @@ impl Dispatcher {
             egress_pool,
             delivered_this_connection: 0,
             delivery_protocol,
+            smtp_transaction: None,
             leases,
             suspended: None,
             batch_started: None,
@@ -2187,7 +2193,9 @@ impl Dispatcher {
 
             let _timer_rollup = dispatcher.metrics.deliver_message_rollup.start_timer();
             dispatcher.enter_phase(DispatcherPhase::DeliveringMessage);
-            if let Err(err) = dispatcher.deliver_message(&mut *queue_dispatcher).await {
+            let result = dispatcher.deliver_message(&mut *queue_dispatcher).await;
+            let smtp_transaction = dispatcher.smtp_transaction.take();
+            if let Err(err) = result {
                 tracing::debug!("deliver_message: {err:#}");
                 for msg in dispatcher.msgs.drain(..) {
                     let response = Response {
@@ -2197,7 +2205,8 @@ impl Dispatcher {
                         command: None,
                     };
 
-                    log_disposition(LogDisposition {
+                    let config = dispatcher.path_config.borrow();
+                    let args = LogDisposition {
                         kind: RecordType::TransientFailure,
                         msg: msg.clone(),
                         site: &dispatcher.name,
@@ -2209,11 +2218,21 @@ impl Dispatcher {
                         delivery_protocol: Some(&dispatcher.delivery_protocol),
                         tls_info: None,
                         source_address: None,
-                        provider: dispatcher.path_config.borrow().provider_name.as_deref(),
+                        provider: config.provider_name.as_deref(),
                         session_id: Some(dispatcher.session_id),
                         recipient_list: None,
-                    })
-                    .await;
+                    };
+                    match &smtp_transaction {
+                        Some(txn) => {
+                            log_smtp_disposition(
+                                args,
+                                txn.internal_error_fields(),
+                                txn.peer_address.as_ref(),
+                            )
+                            .await
+                        }
+                        None => log_disposition(args).await,
+                    }
                     QueueManager::requeue_message(
                         msg,
                         IncrementAttempts::Yes,

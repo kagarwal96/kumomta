@@ -53,6 +53,7 @@ and values:
 * `log_dir` - specify an alternative log directory for this type
 * `enable` - defaults to `true`. If you set it to `false`, records of this
   type will not be logged
+* `slow_threshold` - optional duration for `SmtpConnectionPlan` only. See [SMTP connection plans](#smtp-connection-plans).
 * `segment_header` - ({{since('2023.11.28-b5252a41', inline=True)}}) text that will be written
   out to each newly opened segment file. Useful for emitting eg: a CSV header
   line.
@@ -90,4 +91,22 @@ named `X-FooBar` you would use `{{ headers['x-foobar'] }}` in your template.
     ```
     {% endraw %}
 
+## SMTP connection plans
+
+{{since('dev')}}
+
+With [outbound SMTP client telemetry](../configure_smtp_client_telemetry.md) enabled, a local logger can write [connection plan records](../../log_record.md#smtp-connection-plan) independently of message dispositions:
+
+```lua
+kumo.configure_local_logs {
+  log_dir = '/var/log/kumo',
+  per_record = {
+    SmtpConnectionPlan = { enable = true, slow_threshold = '2s' },
+  },
+}
+```
+
+An explicit `SmtpConnectionPlan` entry enables plans for that logger; `Any` alone does not. Set `enable = false` or remove the entry to disable them. An enabled logger writes one summary for an empty address list, a failed setup attempt, or a negative peer reply during setup, even if a later attempt succeeds. With `slow_threshold`, it also writes a summary if **either** the address-list build or SMTP setup takes at least that long. There is no default threshold. A partial list alone does not trigger a record. Reusing an existing connection does not generate a plan.
+
+The plan's own `template`, `suffix`, `log_dir` and `segment_header` work as for other local records. A plan has no message, so message headers, metadata and the message-based `filter_event` do not apply. Neither logging hook accepts plan records.
 

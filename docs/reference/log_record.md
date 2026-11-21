@@ -5,7 +5,7 @@ tags:
 
 ## Log Record
 
-The log record is a JSON object with the following shape:
+Message log records are JSON objects with the following shape. An [SMTP connection plan](#smtp-connection-plan) has a separate schema because it describes a connection rather than a message.
 
 ```json
 {
@@ -206,6 +206,36 @@ The following record types are defined:
   kumomta node as part of an [xfer](kcli/xfer.md). {{since('2025.12.02-67ee9e96', inline=True)}}
 * `"XferIn"` - a message was transferred in to the current node from another
   kumomta node as part of an [xfer](kcli/xfer.md). {{since('2025.12.02-67ee9e96', inline=True)}}
+* `"SmtpConnectionPlan"` - a local summary of outbound SMTP setup. See [SMTP connection plan](#smtp-connection-plan). {{since('dev', inline=True)}}
+
+## Outbound SMTP disposition fields
+
+{{since('dev')}}
+
+When [outbound SMTP client telemetry](kumo/configure_smtp_client_telemetry.md) is enabled, local `Delivery`, `TransientFailure` and `Bounce` records can include the following fields. Existing local templates can reference them directly or through `log_record`. They are not added to log hooks.
+
+| Field | Meaning |
+| --- | --- |
+| `connection_id` | Identifies one SMTP-ready connection. Unlike `session_id`, it changes on reconnect. |
+| `transaction_number` | Counts `MAIL FROM` attempts on that connection, starting at `1`. Recipients in one transaction share the same number. |
+| `transaction_elapsed_ms` | Milliseconds from the start of `MAIL FROM` to the final reply or transport failure. |
+| `connection_setup_ms` | On the first transaction only, milliseconds from the first TCP attempt to SMTP-ready, including failed attempts. Neither elapsed field is present if the transaction never started. |
+| `smtp_stage`, `failure_kind` | Where and how SMTP failed. Stages name steps such as `rcpt_to`, `data`, `data_write`, `data_dot` or `pipeline`, without command arguments. `smtp_reply` identifies an actual negative peer reply; a local timeout is not a reply. |
+| `peer_response` | The observed negative peer reply for `failure_kind: smtp_reply`, when available, even if policy rewrote the disposition. Contains `code`, optional `enhanced_code` and `reason`, and only [policy-approved](events/smtp_client_classify_peer_reply.md) `content`. `content_truncated: true` marks a length limit. AUTH replies have no content. |
+| `peer_replies`, `peer_replies_omitted` | Other negative replies from the transaction as `{smtp_stage, response}` pairs, with a count when replies were omitted. They are not additional failed recipients. |
+
+The existing `response` still describes the disposition. It can contain native command and response text, including synthetic local errors. A template that should expose only policy-approved peer text must select `peer_response` or `peer_replies` instead of copying native text. `event_time - created_time` is the age of the message, including retries, not a measurement of time in a particular queue.
+
+## SMTP connection plan
+
+{{since('dev')}}
+
+A `SmtpConnectionPlan` is a local file record. It has `timestamp` and `event_time` like a disposition but no spool ID, envelope, or `created_time`. See [per_record](kumo/configure_local_logs/per_record.md#smtp-connection-plans) for selection and template configuration.
+
+* `session_id` identifies the dispatcher, including on exhaustion. `connection_id` is present only if a connection became SMTP-ready; use it to find related dispositions. `result` describes the plan outcome. `egress_source`, when available, identifies the selected source.
+* `discovery` describes the address source and relevant TLS policy. `address_list` reports the number of hostnames looked up and usable candidates. Its outcome is `no_address` if the list is empty, `partial` if a lookup failed or returned no usable address but another candidate is available, and `complete` otherwise. `address_list_build_ms` measures the interval from the first address lookup until the list is ready; it is absent when no lookup ran.
+* `attempts` lists the tried endpoints in order, with MX, IP when available, known preference, outcome and elapsed milliseconds. Each `phases` entry names the step and its outcome, with `elapsed_ms` when measured. Failed steps can include `failure_kind` and an observed, policy-filtered negative `response`. `attempts_omitted` and `phases_omitted` report entries left out of bounded lists.
+* `connection_setup_ms` excludes address discovery and includes earlier failed connection attempts. If no IP was tried, `attempts` is empty and `connection_setup_ms` is absent.
 
 ## Feedback Report
 

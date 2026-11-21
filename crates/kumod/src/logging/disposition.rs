@@ -4,6 +4,7 @@ use bounce_classify::BounceClass;
 use chrono::Utc;
 use config::{load_config, CallbackSignature};
 use kumo_log_types::rfc3464::ReportAction;
+use kumo_log_types::smtp::SmtpDispositionFields;
 use kumo_log_types::MaybeProxiedSourceAddress;
 pub use kumo_log_types::*;
 use message::Message;
@@ -32,6 +33,51 @@ pub struct LogDisposition<'a> {
 }
 
 pub async fn log_disposition(args: LogDisposition<'_>) {
+    log_disposition_impl(args, None).await;
+}
+
+struct LocalSmtpDisposition<'a> {
+    fields: &'a SmtpDispositionFields,
+    peer_address: Option<&'a ResolvedAddress>,
+}
+
+/// Add SMTP diagnostics to local file records only. The saved peer address
+/// identifies a transaction even when the native disposition has no peer.
+pub async fn log_smtp_disposition(
+    args: LogDisposition<'_>,
+    mut fields: SmtpDispositionFields,
+    local_peer_address: Option<&ResolvedAddress>,
+) {
+    let smtp = if matches!(
+        args.kind,
+        RecordType::Delivery | RecordType::Bounce | RecordType::TransientFailure
+    ) {
+        fields.limit();
+        Some(LocalSmtpDisposition {
+            fields: &fields,
+            peer_address: local_peer_address,
+        })
+    } else {
+        None
+    };
+    log_disposition_impl(args, smtp).await;
+}
+
+fn disposition_peer_and_smtp(
+    hook_name: Option<&str>,
+    native_peer: Option<&ResolvedAddress>,
+    local: Option<&LocalSmtpDisposition<'_>>,
+) -> (Option<ResolvedAddress>, Option<Box<SmtpDispositionFields>>) {
+    match local {
+        Some(local) if hook_name.is_none() => (
+            local.peer_address.or(native_peer).cloned(),
+            Some(Box::new(local.fields.clone())),
+        ),
+        _ => (native_peer.cloned(), None),
+    }
+}
+
+async fn log_disposition_impl(args: LogDisposition<'_>, smtp: Option<LocalSmtpDisposition<'_>>) {
     let LogDisposition {
         mut kind,
         msg,
@@ -150,6 +196,8 @@ pub async fn log_disposition(args: LogDisposition<'_>) {
             tls_peer_subject_name.replace(info.subject_name.clone());
         }
 
+        let (record_peer_address, smtp) =
+            disposition_peer_and_smtp(logger.hook_name.as_deref(), peer_address, smtp.as_ref());
         let record = JsonLogRecord {
             kind,
             id: msg.id().to_string(),
@@ -165,7 +213,7 @@ pub async fn log_disposition(args: LogDisposition<'_>) {
                 .await
                 .unwrap_or_else(|err| format!("{err:#}")),
             site: site.to_string(),
-            peer_address: peer_address.cloned(),
+            peer_address: record_peer_address,
             response: response.clone(),
             timestamp: now,
             created: msg.id().created(),
@@ -185,6 +233,7 @@ pub async fn log_disposition(args: LogDisposition<'_>) {
             source_address: source_address.clone(),
             provider_name: provider.map(|s| s.to_string()),
             session_id,
+            smtp,
         };
         if let Err(err) = logger.log(record, Some(msg.clone())).await {
             tracing::error!("failed to log: {err:#}");
@@ -282,6 +331,7 @@ pub async fn log_disposition(args: LogDisposition<'_>) {
                             source_address: None,
                             provider_name: provider.map(|s| s.to_string()),
                             session_id,
+                            smtp: None,
                         };
 
                         if let Err(err) =
@@ -293,5 +343,49 @@ pub async fn log_disposition(args: LogDisposition<'_>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn saved_transaction_peer_and_smtp_fields_are_local_only() {
+        let peer = ResolvedAddress {
+            name: "mx.example".into(),
+            addr: Ipv4Addr::new(192, 0, 2, 1).into(),
+            is_secure: false,
+        };
+        let fields = SmtpDispositionFields {
+            transaction_number: Some(7),
+            ..Default::default()
+        };
+        let saved = LocalSmtpDisposition {
+            fields: &fields,
+            peer_address: Some(&peer),
+        };
+
+        // A generic post-transaction error has no native peer. Both queued
+        // and immediate hooks are named; only the local file logger is unnamed.
+        let (addr, smtp) = disposition_peer_and_smtp(None, None, Some(&saved));
+        assert_eq!(addr.as_ref(), Some(&peer));
+        assert_eq!(smtp.as_deref(), Some(&fields));
+        assert_eq!(
+            disposition_peer_and_smtp(Some("hook"), None, Some(&saved)),
+            (None, None)
+        );
+
+        // A normal SMTP disposition already knows its peer in every sink.
+        let normal = LocalSmtpDisposition {
+            peer_address: None,
+            ..saved
+        };
+        let (addr, smtp) = disposition_peer_and_smtp(None, Some(&peer), Some(&normal));
+        assert_eq!(addr.as_ref(), Some(&peer));
+        assert_eq!(smtp.as_deref(), Some(&fields));
+        let (addr, smtp) = disposition_peer_and_smtp(Some("hook"), Some(&peer), Some(&normal));
+        assert_eq!(addr.as_ref(), Some(&peer));
+        assert!(smtp.is_none());
     }
 }

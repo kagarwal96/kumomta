@@ -161,6 +161,9 @@ pub fn err_match<'a, T: std::error::Error + 'static>(
     }
 }
 
+pub(crate) type ConnectObserver<'a> =
+    dyn Fn(Instant, Option<Result<(), std::io::ErrorKind>>) + Send + Sync + 'a;
+
 impl EgressSource {
     pub async fn resolve(name: &str, config: &mut LuaConfig) -> anyhow::Result<Self> {
         SOURCES
@@ -326,6 +329,16 @@ impl EgressSource {
         address: SocketAddr,
         timeout_duration: Duration,
     ) -> anyhow::Result<(TcpStream, MaybeProxiedSourceAddress)> {
+        self.connect_to_with_observer(address, timeout_duration, None)
+            .await
+    }
+
+    pub(crate) async fn connect_to_with_observer(
+        &self,
+        address: SocketAddr,
+        timeout_duration: Duration,
+        observer: Option<&ConnectObserver<'_>>,
+    ) -> anyhow::Result<(TcpStream, MaybeProxiedSourceAddress)> {
         let source_name = &self.name;
 
         // Fail fast rather than waiting the full connect timeout.
@@ -345,7 +358,7 @@ impl EgressSource {
         for proxy in candidates {
             let transport_address = proxy.transport_address(address);
             match self
-                .connect_one(address, proxy, deadline, timeout_duration)
+                .connect_one(address, proxy, deadline, timeout_duration, observer)
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -405,6 +418,7 @@ impl EgressSource {
         proxy: ProxyProto<'_>,
         deadline: Instant,
         timeout_duration: Duration,
+        observer: Option<&ConnectObserver<'_>>,
     ) -> anyhow::Result<(TcpStream, MaybeProxiedSourceAddress)> {
         let source_name = &self.name;
         let transport_address = proxy.transport_address(address);
@@ -445,30 +459,45 @@ impl EgressSource {
             }
         }
 
-        let mut stream =
-            match tokio::time::timeout_at(deadline.into(), socket.connect(transport_address)).await
-            {
-                Err(_) => {
-                    inc_failed_proxy_connection_attempts(is_proxy);
-                    return Err(ConnectError {
-                        is_proxy,
-                        reason: format!(
-                            "timeout after {timeout_duration:?} \
-                             while connecting to {transport_context}"
-                        ),
-                    }
-                    .into());
-                }
-                Ok(Err(err)) => {
-                    inc_failed_proxy_connection_attempts(is_proxy);
-                    return Err(ConnectError {
-                        is_proxy,
-                        reason: format!("failed to connect to {transport_context}: {err:#}"),
-                    }
-                    .into());
-                }
-                Ok(Ok(stream)) => stream,
+        // Time the actual socket operation, not proxy DNS, source selection,
+        // bind, or the proxy handshake. A cancelled dial has no result.
+        let started = observer.map(|f| {
+            let start = Instant::now();
+            f(start, None);
+            start
+        });
+        let connected =
+            tokio::time::timeout_at(deadline.into(), socket.connect(transport_address)).await;
+        if let (Some(observe), Some(start)) = (observer, started) {
+            let result = match &connected {
+                Err(_) => Err(std::io::ErrorKind::TimedOut),
+                Ok(Err(err)) => Err(err.kind()),
+                Ok(Ok(_)) => Ok(()),
             };
+            observe(start, Some(result));
+        }
+        let mut stream = match connected {
+            Err(_) => {
+                inc_failed_proxy_connection_attempts(is_proxy);
+                return Err(ConnectError {
+                    is_proxy,
+                    reason: format!(
+                        "timeout after {timeout_duration:?} \
+                             while connecting to {transport_context}"
+                    ),
+                }
+                .into());
+            }
+            Ok(Err(err)) => {
+                inc_failed_proxy_connection_attempts(is_proxy);
+                return Err(ConnectError {
+                    is_proxy,
+                    reason: format!("failed to connect to {transport_context}: {err:#}"),
+                }
+                .into());
+            }
+            Ok(Ok(stream)) => stream,
+        };
 
         let source_address = tokio::time::timeout_at(
             deadline.into(),

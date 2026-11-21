@@ -25,6 +25,10 @@ pub use kumo_tls_helper::TlsOptions;
 pub use openssl;
 pub use tokio_rustls;
 
+mod observation;
+pub use observation::{SmtpClientObserver, SmtpFailureKind, SmtpObservation, SmtpStage};
+use observation::{TransactionTimer, WireError};
+
 const MAX_LINE_LEN: usize = 4096;
 
 #[derive(Error, Debug, Clone)]
@@ -221,6 +225,7 @@ pub struct SmtpClient {
     read_buffer: Vec<u8>,
     timeouts: SmtpClientTimeouts,
     tracer: Option<Arc<dyn SmtpClientTracer + Send + Sync>>,
+    observer: Option<Arc<dyn SmtpClientObserver>>,
     use_rset: bool,
     enable_rset: bool,
     enable_pipelining: bool,
@@ -271,6 +276,7 @@ impl SmtpClient {
             read_buffer: Vec::with_capacity(1024),
             timeouts,
             tracer: None,
+            observer: None,
             use_rset: false,
             enable_rset: false,
             enable_pipelining: false,
@@ -297,6 +303,48 @@ impl SmtpClient {
 
     pub fn set_tracer(&mut self, tracer: Arc<dyn SmtpClientTracer + Send + Sync>) {
         self.tracer.replace(tracer);
+    }
+
+    /// Enable or disable structured observations on this client. Independent
+    /// of the raw SMTP tracer; neither is enabled by default.
+    pub fn set_observer(&mut self, observer: Option<Arc<dyn SmtpClientObserver>>) {
+        self.observer = observer;
+    }
+
+    fn timer(&self) -> Option<Instant> {
+        self.observer.as_ref().map(|_| Instant::now())
+    }
+
+    fn observe_phase(&self, stage: SmtpStage, started: Instant, failure: Option<SmtpFailureKind>) {
+        if let Some(observer) = &self.observer {
+            observer.observe(SmtpObservation::Phase {
+                stage,
+                duration: started.elapsed(),
+                failure,
+            });
+        }
+    }
+
+    fn observe_reply_phase(
+        &self,
+        stage: SmtpStage,
+        started: Instant,
+        result: &Result<Response, WireError>,
+        expected: u16,
+    ) {
+        let failure = match result {
+            Err(err) => Some(err.kind),
+            Ok(reply) if reply.code != expected => Some(WireError::reply_failure(reply)),
+            Ok(_) => None,
+        };
+        self.observe_phase(stage, started, failure);
+    }
+
+    fn start_mail(&self, timer: Option<&mut TransactionTimer>) {
+        if let (Some(timer), Some(observer), Some(_)) = (timer, &self.observer, &self.socket) {
+            timer.started = Some(Instant::now());
+            observer.observe(SmtpObservation::MailFromStarted);
+        }
     }
 
     pub fn timeouts(&self) -> &SmtpClientTimeouts {
@@ -418,7 +466,16 @@ impl SmtpClient {
     /// by sending what should be a 421, or abruptly by simply snipping
     /// the connection.
     pub async fn check_unilateral_response(&mut self) -> Result<Option<Response>, ClientError> {
-        match self.read_response(None, Duration::ZERO).await {
+        match self
+            .read_response_at(
+                None,
+                Duration::ZERO,
+                SmtpStage::Unilateral,
+                SmtpStage::Unilateral,
+            )
+            .await
+            .map_err(|err| err.error)
+        {
             // Unilateral response was received
             Ok(response) => Ok(Some(response)),
             // Nothing immediately available: this should hopefully be the common case
@@ -433,6 +490,33 @@ impl SmtpClient {
         command: Option<&Command>,
         timeout_duration: Duration,
     ) -> Result<Response, ClientError> {
+        let stage = command.map_or(SmtpStage::Banner, SmtpStage::from);
+        let started = if command.is_none() {
+            self.timer()
+        } else {
+            None
+        };
+        let flush_stage = if stage == SmtpStage::DataDot {
+            SmtpStage::DataWrite
+        } else {
+            stage
+        };
+        let result = self
+            .read_response_at(command, timeout_duration, stage, flush_stage)
+            .await;
+        if let Some(started) = started {
+            self.observe_reply_phase(stage, started, &result, 220);
+        }
+        result.map_err(|err| err.error)
+    }
+
+    async fn read_response_at(
+        &mut self,
+        command: Option<&Command>,
+        timeout_duration: Duration,
+        stage: SmtpStage,
+        flush_stage: SmtpStage,
+    ) -> Result<Response, WireError> {
         let deadline = Instant::now() + timeout_duration;
 
         if let Some(sock) = self.socket.as_mut() {
@@ -447,9 +531,12 @@ impl SmtpClient {
                         });
                         tracer.trace_event(SmtpClientTraceEvent::Closed);
                     }
-                    return Err(ClientError::FlushError {
-                        error: format!("{err:#}"),
-                    });
+                    return Err(WireError::new(
+                        flush_stage,
+                        ClientError::FlushError {
+                            error: format!("{err:#}"),
+                        },
+                    ));
                 }
                 Err(_elapsed) => {
                     self.socket.take();
@@ -460,14 +547,37 @@ impl SmtpClient {
                         });
                         tracer.trace_event(SmtpClientTraceEvent::Closed);
                     }
-                    return Err(ClientError::TimeOutResponse {
-                        command: command.cloned(),
-                        duration: timeout_duration,
+                    // Keep the public error contract, while attributing a timed
+                    // out flush to the write rather than the next reply.
+                    return Err(WireError {
+                        stage: flush_stage,
+                        kind: SmtpFailureKind::WriteTimeout,
+                        error: ClientError::TimeOutResponse {
+                            command: command.cloned(),
+                            duration: timeout_duration,
+                        },
                     });
                 }
             }
         }
 
+        let response = self
+            .read_reply(command, deadline)
+            .await
+            .map_err(|err| WireError::new(stage, err))?;
+        if let Some(observer) = &self.observer {
+            if (400..600).contains(&response.code) {
+                observer.observe(SmtpObservation::peer_reply(stage, &response));
+            }
+        }
+        Ok(response)
+    }
+
+    async fn read_reply(
+        &mut self,
+        command: Option<&Command>,
+        deadline: Instant,
+    ) -> Result<Response, ClientError> {
         let mut line = self
             .read_line(deadline.saturating_duration_since(Instant::now()), command)
             .await?;
@@ -494,9 +604,35 @@ impl SmtpClient {
     }
 
     pub async fn send_command(&mut self, command: &Command) -> Result<Response, ClientError> {
-        self.write_command_request(command).await?;
-        self.read_response(Some(command), command.client_timeout(&self.timeouts))
+        let stage = SmtpStage::from(command);
+        let expected = match stage {
+            SmtpStage::Ehlo => Some(250),
+            SmtpStage::Auth => Some(235),
+            _ => None,
+        };
+        let timer = expected.and_then(|code| self.timer().map(|started| (started, code)));
+        let result = self.send_command_at(command, stage).await;
+        if let Some((started, expected)) = timer {
+            self.observe_reply_phase(stage, started, &result, expected);
+        }
+        result.map_err(|err| err.error)
+    }
+
+    async fn send_command_at(
+        &mut self,
+        command: &Command,
+        stage: SmtpStage,
+    ) -> Result<Response, WireError> {
+        self.write_command_request(command, None)
             .await
+            .map_err(|err| WireError::new(stage, err))?;
+        self.read_response_at(
+            Some(command),
+            command.client_timeout(&self.timeouts),
+            stage,
+            stage,
+        )
+        .await
     }
 
     /// Wrapper around socket.write_all() that will emit trace diagnostics and synthesize
@@ -545,7 +681,11 @@ impl SmtpClient {
         }
     }
 
-    async fn write_pipeline_request(&mut self, commands: &[Command]) -> Result<(), ClientError> {
+    async fn write_pipeline_request(
+        &mut self,
+        commands: &[Command],
+        timer: Option<&mut TransactionTimer>,
+    ) -> Result<(), ClientError> {
         let total_timeout: Duration = commands
             .iter()
             .map(|cmd| cmd.client_timeout_request(&self.timeouts))
@@ -572,6 +712,7 @@ impl SmtpClient {
                 }
             }
         }
+        self.start_mail(timer);
         self.write_all_with_timeout(
             total_timeout,
             &all,
@@ -587,7 +728,11 @@ impl SmtpClient {
         .await
     }
 
-    async fn write_command_request(&mut self, command: &Command) -> Result<(), ClientError> {
+    async fn write_command_request(
+        &mut self,
+        command: &Command,
+        timer: Option<&mut TransactionTimer>,
+    ) -> Result<(), ClientError> {
         let line = command.encode();
         tracing::trace!("send->{}: {line}", self.hostname);
         if self.socket.is_some() {
@@ -597,6 +742,9 @@ impl SmtpClient {
         }
 
         let timeout_duration = command.client_timeout_request(&self.timeouts);
+        if matches!(command, Command::MailFrom { .. }) {
+            self.start_mail(timer);
+        }
         self.write_all_with_timeout(
             timeout_duration,
             &line,
@@ -612,7 +760,11 @@ impl SmtpClient {
         .await
     }
 
-    async fn write_data_with_timeout(&mut self, data: &[u8]) -> Result<(), ClientError> {
+    async fn write_mail_data(
+        &mut self,
+        data: &[u8],
+        timer: &mut TransactionTimer,
+    ) -> Result<(), WireError> {
         if self.socket.is_some() {
             if let Some(tracer) = &self.tracer {
                 BinWriteTracer::trace(tracer, data);
@@ -629,6 +781,10 @@ impl SmtpClient {
             },
         )
         .await
+        .map_err(|err| {
+            timer.mark_end();
+            WireError::new(SmtpStage::DataWrite, err)
+        })
     }
 
     /// Issue a series of commands, and return the responses to
@@ -650,46 +806,71 @@ impl SmtpClient {
         &mut self,
         commands: Vec<Command>,
     ) -> Vec<Result<Response, ClientError>> {
-        let mut results: Vec<Result<Response, ClientError>> = vec![];
+        self.pipeline_commands_inner(commands, None)
+            .await
+            .into_iter()
+            .map(|result| result.map_err(|err| err.error))
+            .collect()
+    }
 
+    async fn pipeline_commands_inner(
+        &mut self,
+        commands: Vec<Command>,
+        mut timer: Option<&mut TransactionTimer>,
+    ) -> Vec<Result<Response, WireError>> {
+        let mut results = vec![];
         let pipeline = self.enable_pipelining && self.capabilities.contains_key("PIPELINING");
         if pipeline {
-            if let Err(err) = self.write_pipeline_request(&commands).await {
-                let err: ClientError = err;
-                results.push(Err(err.clone()));
-                while results.len() < commands.len() {
-                    // Synthesize failures for the remaining commands
-                    results.push(Err(err.clone()));
+            if let Err(err) = self
+                .write_pipeline_request(&commands, timer.as_deref_mut())
+                .await
+            {
+                if let Some(timer) = timer.as_deref_mut() {
+                    timer.mark_end();
                 }
+                results.resize(
+                    commands.len().max(1),
+                    Err(WireError::new(SmtpStage::Pipeline, err)),
+                );
                 return results;
             }
-
-            // Now read the responses effectively in a batch
-            for cmd in &commands {
-                results.push(
-                    self.read_response(Some(cmd), cmd.client_timeout(&self.timeouts))
-                        .await,
-                );
-            }
-            return results;
         }
 
-        for cmd in &commands {
-            if let Err(err) = self.write_command_request(cmd).await {
-                let err: ClientError = err;
-                results.push(Err(err.clone()));
-                while results.len() < commands.len() {
-                    // Synthesize failures for the remaining commands
-                    results.push(Err(err.clone()));
+        for (index, cmd) in commands.iter().enumerate() {
+            let stage = SmtpStage::from(cmd);
+            // Do not let synthesized errors after a disconnect extend the timer.
+            let had_socket = self.socket.is_some();
+            if !pipeline {
+                if let Err(err) = self.write_command_request(cmd, timer.as_deref_mut()).await {
+                    if had_socket {
+                        if let Some(timer) = timer.as_deref_mut() {
+                            timer.mark_end();
+                        }
+                    }
+                    // Fill the remaining slots without inventing wire observations.
+                    results.resize(commands.len(), Err(WireError::new(stage, err)));
+                    break;
                 }
-                return results;
             }
-            // Immediately request the response if the server
-            // doesn't support pipelining
-            results.push(
-                self.read_response(Some(cmd), cmd.client_timeout(&self.timeouts))
-                    .await,
-            );
+            let flush_stage = if pipeline && index == 0 {
+                SmtpStage::Pipeline
+            } else {
+                stage
+            };
+            let reply = self
+                .read_response_at(
+                    Some(cmd),
+                    cmd.client_timeout(&self.timeouts),
+                    stage,
+                    flush_stage,
+                )
+                .await;
+            if had_socket && (reply.is_err() || index + 1 == commands.len()) {
+                if let Some(timer) = timer.as_deref_mut() {
+                    timer.mark_end();
+                }
+            }
+            results.push(reply);
         }
         results
     }
@@ -795,19 +976,44 @@ impl SmtpClient {
     /// handshake the client is unusable. A new connection is required to send
     /// further commands.
     pub async fn starttls(&mut self, options: TlsOptions) -> Result<TlsStatus, ClientError> {
-        let resp = self.send_command(&Command::StartTls).await?;
-        if resp.code != 220 {
-            return Err(ClientError::Rejected(resp));
-        }
-
-        self.tls_handshake(options).await
+        self.negotiate_tls(options, Some(&Command::StartTls)).await
     }
 
     /// Perform the TLS handshake directly on the current socket, without a
     /// preceding STARTTLS negotiation. Used for implicit TLS (SMTPS), where
     /// the session is encrypted from the first byte.
     pub async fn tls_connect(&mut self, options: TlsOptions) -> Result<TlsStatus, ClientError> {
-        self.tls_handshake(options).await
+        self.negotiate_tls(options, None).await
+    }
+
+    async fn negotiate_tls(
+        &mut self,
+        options: TlsOptions,
+        upgrade_command: Option<&Command>,
+    ) -> Result<TlsStatus, ClientError> {
+        let stage = SmtpStage::StartTls;
+        let started = self.timer();
+        let result = async {
+            if let Some(command) = upgrade_command {
+                let reply = self.send_command_at(command, stage).await?;
+                if reply.code != 220 {
+                    return Err(WireError::rejected(stage, reply));
+                }
+            }
+            self.tls_handshake(options)
+                .await
+                .map_err(|err| WireError::new(stage, err))
+        }
+        .await;
+        if let Some(started) = started {
+            let failure = match &result {
+                Ok(TlsStatus::Info(_)) => None,
+                Ok(TlsStatus::FailedHandshake(_)) => Some(SmtpFailureKind::TlsError),
+                Err(err) => Some(err.kind),
+            };
+            self.observe_phase(stage, started, failure);
+        }
+        result.map_err(|err| err.error)
     }
 
     async fn tls_handshake(&mut self, options: TlsOptions) -> Result<TlsStatus, ClientError> {
@@ -982,9 +1188,37 @@ impl SmtpClient {
         recipient_list: Vec<ForwardPath>,
         data: B,
     ) -> Result<BatchSendSuccess, ClientError> {
-        let sender = sender.into();
+        let mut timer = TransactionTimer::default();
+        let result = self
+            .send_mail_transaction(sender.into(), recipient_list, data.as_ref(), &mut timer)
+            .await;
+        if let Some(observer) = &self.observer {
+            if let Some(started) = timer.started {
+                observer.observe(SmtpObservation::TransactionFinished {
+                    duration: timer.finished.unwrap_or_else(Instant::now) - started,
+                    stage: result
+                        .as_ref()
+                        .err()
+                        .map_or(SmtpStage::DataDot, |err| err.stage),
+                    failure: result.as_ref().err().map(|err| err.kind),
+                });
+            } else if let Err(err) = &result {
+                observer.observe(SmtpObservation::BeforeMailFromFailure {
+                    stage: err.stage,
+                    failure: err.kind,
+                });
+            }
+        }
+        result.map_err(|err| err.error)
+    }
 
-        let data: &[u8] = data.as_ref();
+    async fn send_mail_transaction(
+        &mut self,
+        sender: ReversePath,
+        recipient_list: Vec<ForwardPath>,
+        data: &[u8],
+        timer: &mut TransactionTimer,
+    ) -> Result<BatchSendSuccess, WireError> {
         let stuffed;
 
         let data = match apply_dot_stuffing(data) {
@@ -1007,19 +1241,22 @@ impl SmtpClient {
                     value: Some("8BITMIME".to_string()),
                 });
             } else if !self.ignore_8bit_checks {
-                return Err(ClientError::Rejected(Response {
-                    code: 554,
-                    command: None,
-                    enhanced_code: Some(EnhancedStatusCode {
-                        class: 5,
-                        subject: 6,
-                        detail: 3,
-                    }),
-                    content: "KumoMTA internal: DATA is 8bit, destination does \
+                return Err(WireError::new(
+                    SmtpStage::Other,
+                    ClientError::Rejected(Response {
+                        code: 554,
+                        command: None,
+                        enhanced_code: Some(EnhancedStatusCode {
+                            class: 5,
+                            subject: 6,
+                            detail: 3,
+                        }),
+                        content: "KumoMTA internal: DATA is 8bit, destination does \
                         not support 8BITMIME. Conversion via msg:check_fix_conformance \
                         during reception is required"
-                        .to_string(),
-                }));
+                            .to_string(),
+                    }),
+                ));
             }
         }
 
@@ -1030,18 +1267,21 @@ impl SmtpClient {
                     value: None,
                 });
             } else if !self.ignore_8bit_checks {
-                return Err(ClientError::Rejected(Response {
-                    code: 554,
-                    command: None,
-                    enhanced_code: Some(EnhancedStatusCode {
-                        class: 5,
-                        subject: 6,
-                        detail: 7,
-                    }),
-                    content: "KumoMTA internal: envelope is 8bit, destination does \
+                return Err(WireError::new(
+                    SmtpStage::Other,
+                    ClientError::Rejected(Response {
+                        code: 554,
+                        command: None,
+                        enhanced_code: Some(EnhancedStatusCode {
+                            class: 5,
+                            subject: 6,
+                            detail: 7,
+                        }),
+                        content: "KumoMTA internal: envelope is 8bit, destination does \
                         not support SMTPUTF8."
-                        .to_string(),
-                }));
+                            .to_string(),
+                    }),
+                ));
             }
         }
 
@@ -1077,8 +1317,7 @@ impl SmtpClient {
         // to ensure that we RSET the connection on the next go around.
         self.use_rset = true;
 
-        let mut responses = self.pipeline_commands(commands).await;
-
+        let mut responses = self.pipeline_commands_inner(commands, Some(timer)).await;
         // This is a little awkward. We want to handle the RFC 2090 3.1 case
         // below, which requires deferring checking the actual response codes
         // until later, but we must also handle the case where we had a hard
@@ -1091,13 +1330,13 @@ impl SmtpClient {
         if used_rset {
             let rset_resp = responses.remove(0)?;
             if rset_resp.code != 250 {
-                return Err(ClientError::Rejected(rset_resp));
+                return Err(WireError::rejected(SmtpStage::Rset, rset_resp));
             }
         }
 
         let mail_resp = responses.remove(0)?;
         if is_err && mail_resp.code != 250 {
-            return Err(ClientError::Rejected(mail_resp));
+            return Err(WireError::rejected(SmtpStage::MailFrom, mail_resp));
         }
 
         let mut rcpt_responses = vec![];
@@ -1106,12 +1345,12 @@ impl SmtpClient {
         }
 
         if is_err && rcpt_responses.iter().all(|resp| resp.code != 250) {
-            return Err(ClientError::RejectedBatch(rcpt_responses));
+            return Err(WireError::rejected_batch(rcpt_responses));
         }
 
         let data_resp = responses.remove(0)?;
         if is_err && data_resp.code != 354 {
-            return Err(ClientError::Rejected(data_resp));
+            return Err(WireError::rejected(SmtpStage::Data, data_resp));
         }
 
         if data_resp.code == 354
@@ -1125,12 +1364,8 @@ impl SmtpClient {
             // should send a single dot.
 
             // Send dummy data
-            self.write_data_with_timeout(b".\r\n").await?;
-            let data_dot = Command::DataDot;
-            // wait for its response
-            let _ = self
-                .read_response(Some(&data_dot), data_dot.client_timeout(&self.timeouts))
-                .await?;
+            self.write_mail_data(b".\r\n", timer).await?;
+            self.read_data_dot(timer).await?;
 
             // Continue below: we will match one of the failure cases and
             // return a ClientError::Rejected from one of the earlier
@@ -1138,38 +1373,36 @@ impl SmtpClient {
         }
 
         if mail_resp.code != 250 {
-            return Err(ClientError::Rejected(mail_resp));
+            return Err(WireError::rejected(SmtpStage::MailFrom, mail_resp));
         }
         if rcpt_responses.iter().all(|resp| resp.code != 250) {
             if rcpt_responses.len() == 1 {
-                return Err(ClientError::Rejected(
+                return Err(WireError::rejected(
+                    SmtpStage::RcptTo,
                     rcpt_responses.pop().expect("have at least one"),
                 ));
             }
-            return Err(ClientError::RejectedBatch(rcpt_responses));
+            return Err(WireError::rejected_batch(rcpt_responses));
         }
         if data_resp.code != 354 {
-            return Err(ClientError::Rejected(data_resp));
+            return Err(WireError::rejected(SmtpStage::Data, data_resp));
         }
 
         let needs_newline = data.last().map(|&b| b != b'\n').unwrap_or(true);
 
         tracing::trace!("message data is {} bytes", data.len());
 
-        self.write_data_with_timeout(data).await?;
+        self.write_mail_data(data, timer).await?;
 
         let marker = if needs_newline { "\r\n.\r\n" } else { ".\r\n" };
 
         tracing::trace!("send->{}: {}", self.hostname, marker.escape_debug());
 
-        self.write_data_with_timeout(marker.as_bytes()).await?;
+        self.write_mail_data(marker.as_bytes(), timer).await?;
 
-        let data_dot = Command::DataDot;
-        let resp = self
-            .read_response(Some(&data_dot), data_dot.client_timeout(&self.timeouts))
-            .await?;
+        let resp = self.read_data_dot(timer).await?;
         if resp.code != 250 {
-            return Err(ClientError::Rejected(resp));
+            return Err(WireError::rejected(SmtpStage::DataDot, resp));
         }
 
         // If everything went well, respect the user preference for speculatively
@@ -1180,6 +1413,19 @@ impl SmtpClient {
             response: resp,
             rcpt_responses,
         })
+    }
+
+    async fn read_data_dot(&mut self, timer: &mut TransactionTimer) -> Result<Response, WireError> {
+        let reply = self
+            .read_response_at(
+                Some(&Command::DataDot),
+                self.timeouts.data_dot_timeout,
+                SmtpStage::DataDot,
+                SmtpStage::DataWrite,
+            )
+            .await;
+        timer.mark_end();
+        reply
     }
 }
 

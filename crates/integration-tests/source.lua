@@ -16,6 +16,20 @@ local MAX_RECIPIENTS_PER_BATCH = (os.getenv 'KUMOD_MAX_RECIPIENTS_PER_BATCH')
   or 100
 local USE_SPLIT_TXN = os.getenv 'KUMOD_USE_SPLIT_TXN'
 local INVALID_LINE_ENDINGS = os.getenv 'KUMOD_INVALID_LINE_ENDINGS'
+local SMTP_TELEMETRY = os.getenv 'KUMOD_TEST_SMTP_TELEMETRY'
+
+if SMTP_TELEMETRY == 'classify' then
+  kumo.on('smtp_client_classify_peer_reply', function(group, stage, reply)
+    if stage == 'rcpt_to' then
+      if group == 'sink' and reply.content == 'tempfail requested' then
+        return { reason = 'temporary', content = 'Retry later' }
+      end
+      return { reason = 'unlisted' }
+    end
+    -- The pipelined DATA also fails. Callback errors must not expose its text.
+    error(reply.content)
+  end)
+end
 
 kumo.on('init', function()
   kumo.configure_accounting_db_path(TEST_DIR .. '/accounting.db')
@@ -52,8 +66,24 @@ kumo.on('init', function()
     listen = '127.0.0.1:0',
   }
 
+  local per_record
+  if SMTP_TELEMETRY then
+    local policy = {
+      providers = { sink = { 'localhost', 'workinghost' } },
+      reasons = { 'temporary' },
+      enhanced_codes = { '5.5.0' },
+    }
+    kumo.configure_smtp_client_telemetry(policy)
+    if SMTP_TELEMETRY == 'classify' then
+      kumo.configure_smtp_client_telemetry(policy)
+      assert(not pcall(kumo.configure_smtp_client_telemetry, {}))
+    end
+    per_record = { SmtpConnectionPlan = { log_dir = TEST_DIR .. '/plans' } }
+  end
+
   kumo.configure_local_logs {
     log_dir = TEST_DIR .. '/logs',
+    per_record = per_record,
     max_segment_duration = '1s',
     headers = { 'X-*', 'Y-*', 'Subject' },
     meta = { 'xfer*' },
@@ -360,6 +390,7 @@ kumo.on('get_egress_path_config', function(domain, source_name, _site_name)
   local params = {
     enable_tls = os.getenv 'KUMOD_ENABLE_TLS' or 'OpportunisticInsecure',
     tls_mode = os.getenv 'KUMOD_EGRESS_TLS_MODE' or 'StartTls',
+    data_dot_timeout = os.getenv 'KUMOD_TEST_DATA_DOT_TIMEOUT',
     reconnect_strategy = os.getenv 'KUMOD_RECONNECT_STRATEGY'
       or 'ConnectNextHost',
     prohibited_hosts = {},
@@ -418,8 +449,13 @@ kumo.on('get_egress_path_config', function(domain, source_name, _site_name)
     params.allow_smtp_auth_plain_without_valid_certificate = true
   end
 
-  if domain == 'two-hosts.example.com' then
+  if domain == 'two-hosts.example.com' or SMTP_TELEMETRY == 'classify' then
     params.connection_limit = 1
+  end
+
+  if SMTP_TELEMETRY == 'unused' then
+    -- Close each ready socket after one message, even for a local refusal.
+    params.max_deliveries_per_connection = 1
   end
 
   if domain == 'webhookbatch.log_hook' then
