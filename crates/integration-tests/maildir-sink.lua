@@ -111,6 +111,12 @@ local function apply_greylist(envelope_addr, conn_meta)
 end
 
 local function apply_rejections(envelope_addr, conn_meta)
+  if envelope_addr.user == 'retry-short' then
+    kumo.reject(450, '4.7.1 tempfail requested')
+  elseif envelope_addr.user == 'retry-long' then
+    -- Mismatched class; the log limit falls inside é, before the classifier cue.
+    kumo.reject(450, '5.7.1 ' .. string.rep('x', 255) .. 'é retry later')
+  end
   if string.find(envelope_addr.user, 'full-enh') then
     kumo.reject(452, '4.1.1 mailbox is full')
   end

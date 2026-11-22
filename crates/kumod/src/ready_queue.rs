@@ -9,16 +9,14 @@ use crate::http_server::admin_suspend_ready_q_v1::{
 use crate::http_server::admin_suspend_v1::AdminSuspendEntry;
 use crate::http_server::inject_v1::HttpInjectionGeneratorDispatcher;
 use crate::http_server::queue_name_multi_index::CachedEntry;
-use crate::logging::disposition::{
-    log_disposition, log_smtp_disposition, LogDisposition, RecordType,
-};
+use crate::logging::disposition::{log_disposition, LogDisposition, RecordType};
 use crate::lua_deliver::LuaQueueDispatcher;
 use crate::metrics_helper::TOTAL_READYQ_RUNS;
 use crate::queue::{
     DeliveryProto, IncrementAttempts, InsertContext, InsertReason, Queue, QueueConfig,
     QueueManager, QueueState,
 };
-use crate::smtp_dispatcher::SmtpDispatcher;
+use crate::smtp_dispatcher::{resolve_smtp_mx, SmtpDispatcher, Transaction};
 use crate::smtp_server::DeferredSmtpInjectionDispatcher;
 use crate::spool::SpoolManager;
 use crate::xfer::XferDispatcher;
@@ -323,7 +321,7 @@ impl ReadyQueueManager {
         let site_name = match &queue_config.borrow().protocol {
             DeliveryProto::Smtp { smtp } => {
                 if smtp.mx_list.is_empty() {
-                    mx.replace(crate::smtp_dispatcher::resolve_smtp_mx(routing_domain).await?);
+                    mx.replace(resolve_smtp_mx(routing_domain).await?);
                     mx.as_ref().unwrap().site_name.to_string()
                 } else {
                     let mut mx_list = vec![];
@@ -1758,7 +1756,7 @@ pub struct Dispatcher {
     pub session_id: Uuid,
     /// Retain the wire result through per-recipient policy and spool operations.
     /// An internal error after MAIL FROM still belongs to that transaction.
-    pub(crate) smtp_transaction: Option<Box<crate::smtp_dispatcher::Transaction>>,
+    pub(crate) smtp_transaction: Option<Box<Transaction>>,
     leases: Vec<LimitLease>,
     batch_started: Option<tokio::time::Instant>,
     pub states: Arc<FairMutex<ReadyQueueStates>>,
@@ -2205,8 +2203,7 @@ impl Dispatcher {
                         command: None,
                     };
 
-                    let config = dispatcher.path_config.borrow();
-                    let args = LogDisposition {
+                    LogDisposition {
                         kind: RecordType::TransientFailure,
                         msg: msg.clone(),
                         site: &dispatcher.name,
@@ -2218,21 +2215,12 @@ impl Dispatcher {
                         delivery_protocol: Some(&dispatcher.delivery_protocol),
                         tls_info: None,
                         source_address: None,
-                        provider: config.provider_name.as_deref(),
+                        provider: dispatcher.path_config.borrow().provider_name.as_deref(),
                         session_id: Some(dispatcher.session_id),
                         recipient_list: None,
-                    };
-                    match &smtp_transaction {
-                        Some(txn) => {
-                            log_smtp_disposition(
-                                args,
-                                txn.internal_error_fields(),
-                                txn.peer_address.as_ref(),
-                            )
-                            .await
-                        }
-                        None => log_disposition(args).await,
                     }
+                    .log_smtp_internal_error(smtp_transaction.as_deref())
+                    .await;
                     QueueManager::requeue_message(
                         msg,
                         IncrementAttempts::Yes,

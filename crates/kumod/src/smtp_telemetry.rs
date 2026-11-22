@@ -1,14 +1,13 @@
 //! Optional outbound SMTP telemetry. Only configured or protocol-defined values may
 //! be passed to a metric vector. In particular, a caller's provider argument is not
 //! necessarily a label: validate it again at the point of observation.
-use anyhow::{ensure, Context};
+use anyhow::ensure;
 use config::{any_err, declare_event, get_or_create_module, SerdeWrappedValue};
-use kumo_log_types::smtp::SmtpPeerResponse;
 use kumo_prometheus::declare_metric;
 use mlua::{Lua, Value};
-use rfc5321::{EnhancedStatusCode, Response};
+use rfc5321::{EnhancedStatusCode, Response, SmtpStage};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -17,10 +16,8 @@ mod tests;
 
 const MAX_PROVIDERS: usize = 32;
 const MAX_HOST_RULES: usize = 128;
-const MAX_ENHANCED_CODES: usize = 32;
 const MAX_REASONS: usize = 16;
 const MAX_CLASSIFIER_INPUT: usize = 1024;
-const MAX_LOG_CONTENT: usize = 256;
 // Include sub-second DNS/cache and LAN timings as well as SMTP command timeouts.
 const SECONDS: &[f64] = &[
     0.001, 0.01, 0.05, 0.1, 0.25, 1., 2., 5., 15., 60., 300., 600.,
@@ -68,16 +65,15 @@ static PER_CONNECTION: HistogramVec("smtp_client_transactions_per_connection", &
 declare_metric! {
 /// Negative replies read from the SMTP peer, counted before disposition policy.
 ///
-/// `smtp_code` is the peer's numeric reply code (400–599). For provider, DSN and reason
+/// `smtp_code` is the peer's numeric reply code (400–599). For provider and reason
 /// labels, see [kumo.configure_smtp_client_telemetry](../../kumo/configure_smtp_client_telemetry.md).
-static REFUSALS: IntCounterVec("smtp_client_peer_refusals_total", &["destination_relay_group", "smtp_code", "dsn", "reason"]);
+static REFUSALS: IntCounterVec("smtp_client_peer_refusals_total", &["destination_relay_group", "smtp_code", "reason"]);
 }
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Params {
     providers: BTreeMap<String, Vec<String>>,
-    enhanced_codes: Vec<String>,
     reasons: Vec<String>,
 }
 
@@ -86,7 +82,6 @@ struct Policy {
     providers: BTreeSet<String>,
     exact_hosts: BTreeMap<String, String>,
     subdomains: BTreeMap<String, String>,
-    enhanced_codes: HashMap<EnhancedStatusCode, String>,
     reasons: BTreeSet<String>,
 }
 
@@ -114,27 +109,6 @@ fn valid_hostname(s: &str) -> bool {
         && s.parse::<std::net::IpAddr>().is_err()
 }
 
-fn parse_enhanced_code(code: &str) -> Option<EnhancedStatusCode> {
-    let mut parts = code.split('.');
-    let component = |s: &str| {
-        if s.len() > 3 || !s.bytes().all(|b| b.is_ascii_digit()) || (s != "0" && s.starts_with('0'))
-        {
-            return None;
-        }
-        s.parse().ok()
-    };
-    let code = EnhancedStatusCode {
-        class: match parts.next()? {
-            "4" => 4,
-            "5" => 5,
-            _ => return None,
-        },
-        subject: component(parts.next()?)?,
-        detail: component(parts.next()?)?,
-    };
-    parts.next().is_none().then_some(code)
-}
-
 impl TryFrom<Params> for Policy {
     type Error = anyhow::Error;
 
@@ -148,10 +122,6 @@ impl TryFrom<Params> for Policy {
             "too many SMTP telemetry hostname rules"
         );
         ensure!(
-            params.enhanced_codes.len() <= MAX_ENHANCED_CODES,
-            "invalid SMTP telemetry enhanced status allowlist"
-        );
-        ensure!(
             params.reasons.len() <= MAX_REASONS && params.reasons.iter().all(|s| valid_label(s)),
             "invalid SMTP telemetry reason allowlist"
         );
@@ -159,11 +129,6 @@ impl TryFrom<Params> for Policy {
             reasons: params.reasons.into_iter().collect(),
             ..Self::default()
         };
-        for label in params.enhanced_codes {
-            let code = parse_enhanced_code(&label)
-                .context("invalid SMTP telemetry enhanced status allowlist")?;
-            policy.enhanced_codes.insert(code, label);
-        }
         for (group, rules) in params.providers {
             ensure!(
                 valid_label(&group) && !matches!(group.as_str(), "other" | "unknown"),
@@ -261,18 +226,6 @@ impl Policy {
         } else {
             self.providers.get(group).map_or("other", String::as_str)
         }
-    }
-
-    fn dsn(&self, response: &Response) -> &str {
-        let Some(code) = &response.enhanced_code else {
-            return "unknown";
-        };
-        if u16::from(code.class) != response.code / 100 || code.subject > 999 || code.detail > 999 {
-            return "unknown";
-        }
-        self.enhanced_codes
-            .get(code)
-            .map_or("other", String::as_str)
     }
 }
 
@@ -384,8 +337,6 @@ struct ClassifierInput {
 #[derive(Default)]
 struct Classification {
     reason: Option<String>,
-    content: Option<String>,
-    truncated: bool,
 }
 
 impl mlua::FromLua for Classification {
@@ -393,28 +344,12 @@ impl mlua::FromLua for Classification {
         let Value::Table(table) = value else {
             return Err(mlua::Error::external("expected SMTP classification table"));
         };
-        // Read only these fields. Don't materialize arbitrary return tables or
-        // serialize them into a conversion error containing the original reply.
-        let field = |name: &str| match table.raw_get::<Value>(name)? {
-            Value::Nil => Ok(None),
-            Value::String(s) => Ok(Some(s)),
-            _ => Err(mlua::Error::external("expected SMTP classification string")),
+        let reason = match table.raw_get::<Value>("reason")? {
+            Value::String(s) if s.as_bytes().len() <= 48 => Some(s.to_str()?.to_string()),
+            Value::Nil | Value::String(_) => None,
+            _ => return Err(mlua::Error::external("expected SMTP classification string")),
         };
-        let mut result = Self::default();
-        if let Some(s) = field("reason")? {
-            if s.as_bytes().len() <= 48 {
-                result.reason = Some(s.to_str()?.to_string());
-            }
-        }
-        if let Some(s) = field("content")? {
-            let s = s.to_str()?;
-            if !s.is_empty() && !s.chars().any(char::is_control) {
-                let end = s.floor_char_boundary(MAX_LOG_CONTENT);
-                result.content = Some(s[..end].to_owned());
-                result.truncated = end < s.len();
-            }
-        }
-        Ok(result)
+        Ok(Self { reason })
     }
 }
 
@@ -426,17 +361,12 @@ static CLASSIFY_REPLY: Single(
 }
 
 impl Policy {
-    fn count_refusal(&self, provider: &str, response: &Response, reason: Option<&str>) -> &str {
+    fn count_refusal(&self, provider: &str, code: u16, reason: Option<&str>) -> &str {
         let reason = reason
             .and_then(|s| self.reasons.get(s))
             .map_or("other", String::as_str);
         REFUSALS
-            .with_label_values(&[
-                self.bounded_group(provider),
-                &response.code.to_string(),
-                self.dsn(response),
-                reason,
-            ])
+            .with_label_values(&[self.bounded_group(provider), &code.to_string(), reason])
             .inc();
         reason
     }
@@ -444,41 +374,39 @@ impl Policy {
 
 /// Used when the observer cannot retain another reply for async classification.
 /// Only call for a complete peer reply, in lieu of `peer_reply`, never for a local error.
-pub fn peer_reply_unclassified(provider: &str, response: &Response) {
+pub fn peer_reply_unclassified(provider: &str, code: u16) {
     if let Some(policy) = POLICY.get() {
-        if (400..600).contains(&response.code) {
-            policy.count_refusal(provider, response, None);
+        if (400..600).contains(&code) {
+            policy.count_refusal(provider, code, None);
         }
     }
 }
 
-fn classifier_input<'a>(stage: &'a str, response: &Response) -> (&'a str, ClassifierInput, bool) {
-    let stage = match stage {
-        "banner" | "ehlo" | "starttls" | "auth" | "rset" | "mail_from" | "rcpt_to" | "data"
-        | "data_dot" | "data_write" | "pipeline" | "unilateral" => stage,
-        _ => "other",
-    };
-    let allow_text = !matches!(stage, "auth" | "other" | "data_write" | "pipeline");
-    let truncated = allow_text && response.content.len() > MAX_CLASSIFIER_INPUT;
-    // Do not pass a partial prefix to a policy using an exact phrase allowlist.
-    let content = (allow_text && !truncated && !response.content.is_empty())
-        .then(|| response.content.clone());
-    (
+fn classifier_input(stage: SmtpStage, response: &Response, truncated: bool) -> ClassifierInput {
+    use SmtpStage::*;
+    let allow_text = matches!(
         stage,
-        ClassifierInput {
-            code: response.code,
-            enhanced_code: response.enhanced_code,
-            content,
-        },
-        truncated,
-    )
+        Banner | Ehlo | StartTls | Rset | MailFrom | RcptTo | Data | DataDot | Unilateral
+    );
+    // Only classify complete text. The local log may still retain a marked prefix.
+    let content =
+        (allow_text && !truncated && (1..=MAX_CLASSIFIER_INPUT).contains(&response.content.len()))
+            .then(|| response.content.clone());
+    ClassifierInput {
+        code: response.code,
+        enhanced_code: response.enhanced_code,
+        content,
+    }
 }
 
-async fn classify(group: &str, stage: &str, input: ClassifierInput) -> Classification {
+async fn classify(group: &str, stage: SmtpStage, input: ClassifierInput) -> Classification {
     let run = async {
         let mut lua = config::load_config().await.ok()?;
         let result = lua
-            .async_call_callback(&CLASSIFY_REPLY, (group, stage, SerdeWrappedValue(input)))
+            .async_call_callback(
+                &CLASSIFY_REPLY,
+                (group, stage.as_str(), SerdeWrappedValue(input)),
+            )
             .await;
         lua.put();
         // Lua errors can contain the peer's original text. Never propagate or log them.
@@ -491,28 +419,20 @@ async fn classify(group: &str, stage: &str, input: ClassifierInput) -> Classific
         .unwrap_or_default()
 }
 
-/// Count one real 4xx/5xx and return its log-safe projection. The caller observes
-/// the wire reply, not a per-recipient disposition or a locally assigned code.
-pub async fn peer_reply(provider: &str, stage: &str, response: &Response) -> SmtpPeerResponse {
-    let mut result = SmtpPeerResponse::new(response.code, response.enhanced_code);
-    let Some(policy) = POLICY.get() else {
-        return result;
-    };
+/// Count one observed negative reply and return its bounded reason.
+pub async fn peer_reply(
+    provider: &str,
+    stage: SmtpStage,
+    response: &Response,
+    truncated: bool,
+) -> Option<&'static str> {
+    let policy = POLICY.get()?;
     if !(400..600).contains(&response.code) {
-        return result;
+        return None;
     }
-    let (stage, input, truncated) = classifier_input(stage, response);
-    let allow_text = input.content.is_some();
+    let input = classifier_input(stage, response, truncated);
     let classified = classify(policy.bounded_group(provider), stage, input).await;
     // There is no await between counting and returning. The dispatcher's pending
     // reply guard owns the unclassified increment if this future is cancelled.
-    let reason = policy.count_refusal(provider, response, classified.reason.as_deref());
-    result.reason = Some(reason.into());
-    if truncated || (allow_text && classified.truncated) {
-        result.content_truncated = Some(true);
-    }
-    if allow_text {
-        result.content = classified.content;
-    }
-    result
+    Some(policy.count_refusal(provider, response.code, classified.reason.as_deref()))
 }

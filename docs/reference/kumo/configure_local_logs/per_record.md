@@ -44,16 +44,15 @@ kumo.configure_local_logs {
 
 The keys of the `per_record` table must correspond to one of the
 record types listed below, or the special `Any` key which can be used
-to match any record type that was not explicitly listed.  The values of
-the `per_record` table are `LogRecordParams` have the following fields
-and values:
+to match any message record type that was not explicitly listed. The values of
+the `per_record` table are `LogRecordParams` with the following fields:
 
 * `suffix` - a string to append to the generated segment file name.
   For example, `suffix = '.csv'` will generate names like `20230306-022811.csv`.
 * `log_dir` - specify an alternative log directory for this type
 * `enable` - defaults to `true`. If you set it to `false`, records of this
   type will not be logged
-* `slow_threshold` - optional duration for `SmtpConnectionPlan` only. See [SMTP connection plans](#smtp-connection-plans).
+* `slow_threshold` - optional duration for `SmtpConnection` only. See [SMTP connection records](#smtp-connection-records).
 * `segment_header` - ({{since('2023.11.28-b5252a41', inline=True)}}) text that will be written
   out to each newly opened segment file. Useful for emitting eg: a CSV header
   line.
@@ -91,22 +90,24 @@ named `X-FooBar` you would use `{{ headers['x-foobar'] }}` in your template.
     ```
     {% endraw %}
 
-## SMTP connection plans
+## SMTP connection records
 
 {{since('dev')}}
 
-With [outbound SMTP client telemetry](../configure_smtp_client_telemetry.md) enabled, a local logger can write [connection plan records](../../log_record.md#smtp-connection-plan) independently of message dispositions:
+With [outbound SMTP client telemetry](../configure_smtp_client_telemetry.md) enabled, opt in to [connection records](../../log_record.md#smtp-connection-records) separately for each local file logger:
 
 ```lua
 kumo.configure_local_logs {
   log_dir = '/var/log/kumo',
   per_record = {
-    SmtpConnectionPlan = { enable = true, slow_threshold = '2s' },
+    SmtpConnection = { slow_threshold = '2s' },
   },
 }
 ```
 
-An explicit `SmtpConnectionPlan` entry enables plans for that logger; `Any` alone does not. Set `enable = false` or remove the entry to disable them. An enabled logger writes one summary for an empty address list, a failed setup attempt, or a negative peer reply during setup, even if a later attempt succeeds. With `slow_threshold`, it also writes a summary if **either** the address-list build or SMTP setup takes at least that long. There is no default threshold. A partial list alone does not trigger a record. Reusing an existing connection does not generate a plan.
+`Any` does not enable these records. Remove the `SmtpConnection` entry or set `enable = false` to turn them off.
 
-The plan's own `template`, `suffix`, `log_dir` and `segment_header` work as for other local records. A plan has no message, so message headers, metadata and the message-based `filter_event` do not apply. Neither logging hook accepts plan records.
+Without a `slow_threshold` (the default), the logger writes only empty address lists, failed attempts, and attempts with a negative peer reply, even if setup recovers. A threshold also selects an individual attempt or address-list build that took at least that long. It does not add durations across attempts. Reusing a connection does not generate a setup record.
+
+The record's own `template`, `suffix`, `log_dir` and `segment_header` apply. Message headers, metadata and the message-based `filter_event` do not apply. Neither logging hook accepts `SmtpConnection`.
 

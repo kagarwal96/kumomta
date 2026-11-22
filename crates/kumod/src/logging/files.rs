@@ -1,3 +1,4 @@
+use crate::logging::smtp_client::ConnectionLog;
 use crate::logging::{LogCommand, LogRecordParams};
 use anyhow::Context;
 use chrono::Utc;
@@ -175,9 +176,9 @@ impl LogThreadState {
                     tracing::debug!("LogCommand::Terminate received. Stopping writing logs");
                     break;
                 }
-                LogCommand::SmtpConnectionPlan(record) => {
-                    if let Err(err) = self.do_smtp_connection_plan(record) {
-                        tracing::error!("failed to log SMTP connection plan: {err:#}");
+                LogCommand::SmtpConnection(record) => {
+                    if let Err(err) = self.do_smtp_connection(record) {
+                        tracing::error!("failed to log SMTP connection record: {err:#}");
                     }
                 }
                 LogCommand::Record(record, _msg) => {
@@ -285,35 +286,24 @@ impl LogThreadState {
             tracing::trace!("do_record {record:?}");
         }
         let record = Arc::new(record);
-        self.write_record(
-            record.kind,
-            &record.id,
-            Arc::clone(&record),
-            record.smtp.is_some(),
-        )
+        self.write_record(record.kind, &record.id, &record, record.smtp.is_some())
     }
 
-    fn do_smtp_connection_plan(
+    fn do_smtp_connection(
         &mut self,
-        record: Arc<smtp::SmtpConnectionPlanRecord>,
+        record: Arc<smtp::SmtpConnectionRecord>,
     ) -> anyhow::Result<()> {
-        let kind = RecordType::SmtpConnectionPlan;
-        if !self
-            .params
-            .per_record
-            .get(&kind)
-            .is_some_and(|config| config.enable)
-        {
+        if ConnectionLog::configured(&self.params.per_record).is_none() {
             return Ok(());
         }
-        self.write_record(kind, "", record, true)
+        self.write_record(RecordType::SmtpConnection, "", &record, true)
     }
 
     fn write_record<T: Serialize + Send + Sync + 'static>(
         &mut self,
         kind: RecordType,
         id: &str,
-        record: Arc<T>,
+        record: &Arc<T>,
         has_smtp_diagnostics: bool,
     ) -> anyhow::Result<()> {
         if has_smtp_diagnostics {
@@ -340,19 +330,17 @@ impl LogThreadState {
         if let Some(template) = Self::resolve_template(&self.params, &self.template_engine, kind) {
             let rendered = self
                 .template_engine
-                .prepare_context_with_alias(record, "log_record")
+                .prepare_context_with_alias(record.clone(), "log_record")
                 .and_then(|context| template.render_prepared(&context));
             // A template error can contain the value it tried to render. Keep
             // diagnostic fields out of tracing, including on this failure path.
-            record_text = match rendered {
-                Err(_) if has_smtp_diagnostics => {
-                    anyhow::bail!("failed to render {kind:?} template")
-                }
-                result => result?,
+            if has_smtp_diagnostics && rendered.is_err() {
+                anyhow::bail!("failed to render {kind:?} template");
             }
-            .into_bytes();
+            record_text = rendered?.into_bytes();
         } else {
-            serde_json::to_writer(&mut record_text, &*record).context("serializing record")?;
+            serde_json::to_writer(&mut record_text, record.as_ref())
+                .context("serializing record")?;
         }
         if record_text.last() != Some(&b'\n') {
             record_text.push(b'\n');
@@ -472,6 +460,7 @@ mod test {
     use super::*;
     use flume::bounded;
     use rfc5321::Response;
+    use serde_json::json;
 
     fn state(log_dir: PathBuf, max_record_size: usize) -> LogThreadState {
         let params: LogFileParams = serde_json::from_value(serde_json::json!({
@@ -532,45 +521,51 @@ mod test {
         std::fs::read_dir(dir).map(|rd| rd.count()).unwrap_or(0)
     }
 
-    fn plan_record() -> Arc<smtp::SmtpConnectionPlanRecord> {
-        Arc::new(
-            serde_json::from_str(
-                r#"{
-            "type": "SmtpConnectionPlan", "timestamp": 0,
-            "session_id": "00000000-0000-0000-0000-000000000000",
-            "result": "no_address", "attempts": [], "egress_source": "private-plan-source"
-        }"#,
-            )
-            .unwrap(),
-        )
+    fn connection_record() -> Arc<smtp::SmtpConnectionRecord> {
+        serde_json::from_value(json!({
+            "type": "SmtpConnection", "timestamp": 0, "session_id": uuid::Uuid::nil(),
+            "egress_source": "private-connection-source", "event": "address_list",
+            "outcome": "no_address", "usable_ip_candidates": 0
+        }))
+        .unwrap()
     }
 
-    #[test]
-    fn plan_only_uses_its_explicit_local_template() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = state(dir.path().to_path_buf(), 4096);
-        let plan = plan_record();
-        let template = "{{ type }}:{{ log_record.result }}";
-        state.params.per_record =
-            serde_json::from_value(serde_json::json!({"Any":{"template":"should not render"}}))
-                .unwrap();
-        state.do_smtp_connection_plan(plan.clone()).unwrap();
-        assert_eq!(segment_count(dir.path()), 0);
+    fn set_template(
+        state: &mut LogThreadState,
+        kind: RecordType,
+        template: &str,
+        suffix: Option<&str>,
+    ) {
         state.params.per_record.insert(
-            RecordType::SmtpConnectionPlan,
-            serde_json::from_value(serde_json::json!({"template":template, "suffix":".plan"}))
-                .unwrap(),
+            kind,
+            serde_json::from_value(json!({"template":template, "suffix":suffix})).unwrap(),
         );
         state
             .template_engine
-            .add_template("SmtpConnectionPlan", template)
+            .add_template(format!("{kind:?}"), template)
             .unwrap();
-        state.do_smtp_connection_plan(plan).unwrap();
+    }
+
+    #[test]
+    fn connection_record_only_uses_its_explicit_local_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state(dir.path().to_path_buf(), 4096);
+        let record = connection_record();
+        set_template(&mut state, RecordType::Any, "should not render", None);
+        state.do_smtp_connection(record.clone()).unwrap();
+        assert_eq!(segment_count(dir.path()), 0);
+        set_template(
+            &mut state,
+            RecordType::SmtpConnection,
+            "{{ type }}:{{ event }}:{{ log_record.outcome }}",
+            Some(".smtp"),
+        );
+        state.do_smtp_connection(record).unwrap();
         let path = state.file_map.values().next().unwrap().name.clone();
         state.file_map.clear();
-        assert_eq!(path.extension().unwrap(), "plan");
+        assert_eq!(path.extension().unwrap(), "smtp");
         let text = zstd::stream::decode_all(std::fs::File::open(path).unwrap()).unwrap();
-        assert_eq!(text.as_slice(), b"SmtpConnectionPlan:no_address\n");
+        assert_eq!(text.as_slice(), b"SmtpConnection:address_list:no_address\n");
     }
 
     #[test]
@@ -591,12 +586,7 @@ mod test {
             fn enter(&self, _: &span::Id) {}
             fn exit(&self, _: &span::Id) {}
             fn event(&self, event: &Event<'_>) {
-                let mut text = self.0.lock();
-                event.record(
-                    &mut |_: &tracing::field::Field, value: &dyn std::fmt::Debug| {
-                        text.push_str(&format!("{value:?}\n"));
-                    },
-                );
+                self.0.lock().push_str(&format!("{event:?}\n"));
             }
         }
 
@@ -604,15 +594,8 @@ mod test {
         let mut state = state(dir.path().to_path_buf(), 4096);
         // A missing include can put the requested template name in the error.
         let template = "{% include egress_source or recipient %}";
-        for kind in [RecordType::Delivery, RecordType::SmtpConnectionPlan] {
-            state.params.per_record.insert(
-                kind,
-                serde_json::from_value(serde_json::json!({"template": template})).unwrap(),
-            );
-            state
-                .template_engine
-                .add_template(format!("{kind:?}"), template)
-                .unwrap();
+        for kind in [RecordType::Delivery, RecordType::SmtpConnection] {
+            set_template(&mut state, kind, template, None);
         }
         let trace = Arc::new(Capture::default());
         tracing::subscriber::with_default(trace.clone(), || {
@@ -625,16 +608,18 @@ mod test {
             }));
             let err = state.do_record(enriched).unwrap_err();
             assert_eq!(format!("{err:#}"), "failed to render Delivery template");
-            let err = state.do_smtp_connection_plan(plan_record()).unwrap_err();
+            let err = state.do_smtp_connection(connection_record()).unwrap_err();
             assert_eq!(
                 format!("{err:#}"),
-                "failed to render SmtpConnectionPlan template"
+                "failed to render SmtpConnection template"
             );
         });
         let text = trace.0.lock();
         assert!(text.contains("ordinary@example.com"));
+        assert!(text.contains("writing Delivery record"));
+        assert!(text.contains("writing SmtpConnection record"));
         assert!(!text.contains("private-recipient@example.com"));
-        assert!(!text.contains("private-plan-source"));
+        assert!(!text.contains("private-connection-source"));
     }
 
     #[test]

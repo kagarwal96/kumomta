@@ -1,129 +1,152 @@
 //! Outbound observations are separate from delivery decisions. A plan may span
 //! several sockets; only a socket that reached SMTP-ready has a connection ID.
-use super::{Dispatcher, MxListEntry, SmtpProtocol};
-use crate::logging::log_smtp_connection_plan;
+use super::{Dispatcher, MxListEntry, SmtpDispatcher, SmtpProtocol};
+use crate::logging::disposition::{log_smtp_disposition, LogDisposition};
+use crate::logging::smtp_client::log_smtp_connection;
+use crate::ready_queue::AttemptConnectionDisposition;
 use crate::smtp_telemetry as metrics;
-use kumo_api_types::egress_path::EgressPathConfig;
+use dns_resolver::{has_colon_port, resolve_a_or_aaaa, IpLookupStrategy, Resolver};
 use kumo_log_types::smtp::{
-    SmtpAddressList, SmtpConnectionPlan, SmtpDiscovery, SmtpDispositionFields, SmtpPeerReply,
-    SmtpPeerResponse, SmtpSetupAttempt, SmtpSetupPhase,
+    SmtpConnectionEvent, SmtpDispositionFields, SmtpPeerReply, SmtpPeerResponse,
 };
 use kumo_log_types::ResolvedAddress;
-use mailexchanger::AddressListStats;
+use kumo_server_lifecycle::ShuttingDownError;
+use mailexchanger::{AddressListStats, MailExchanger, ResolvedMxAddresses};
 use parking_lot::Mutex;
 use rfc5321::{Response, SmtpClientObserver, SmtpFailureKind, SmtpObservation, SmtpStage};
 use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::net::UnixStream;
 use uuid::Uuid;
 
-// Limits apply to diagnostics, not to metric observations or the delivery plan.
-const MAX_ATTEMPTS: usize = 16;
-const MAX_PHASES: usize = 16;
+// Limit classifier input and log payload, never the count of wire replies.
 const MAX_REPLIES: usize = 8;
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.
 }
 
-#[derive(Debug)]
-pub(super) struct Plan {
-    provider: String,
-    discovery: SmtpDiscovery,
-    address_list: Option<SmtpAddressList>,
-    build_duration: Option<Duration>,
-    first_dial: Option<Instant>,
-    attempts: Vec<Attempt>,
-    attempt_count: usize,
-    tcp_candidates: usize,
-    failed: bool,
-    pub socket: Option<Arc<SocketObserver>>,
+/// MX resolution may serve several plans, including from cache.
+pub(crate) async fn resolve_smtp_mx(domain: &str) -> anyhow::Result<Arc<MailExchanger>> {
+    let start = metrics::enabled().then(Instant::now);
+    let resolved = MailExchanger::resolve(domain).await;
+    if let Some(start) = start {
+        metrics::phase("unknown", "mx_lookup", resolved.is_ok(), start.elapsed());
+    }
+    resolved
 }
 
-impl Plan {
-    pub fn new(dispatcher: &Dispatcher, config: &SmtpProtocol, path: &EgressPathConfig) -> Self {
-        let (provider, method) = if let Some(mx) = &dispatcher.mx {
-            (
-                metrics::plan_provider(mx.hosts.iter().map(String::as_str)),
-                if mx.is_domain_literal {
-                    "literal"
-                } else if mx.is_mx {
-                    "mx"
-                } else {
-                    "implicit_mx"
-                },
-            )
-        } else {
-            (
-                metrics::plan_provider(config.mx_list.iter().map(MxListEntry::hostname)),
-                "mx_list",
-            )
-        };
-        let mta_sts = match (
-            path.enable_mta_sts,
-            dispatcher.mx.as_ref().map(|mx| mx.mta_sts),
-        ) {
-            (false, _) => "disabled",
-            (_, Some(mailexchanger::PolicyMode::Enforce)) => "enforce",
-            (_, Some(mailexchanger::PolicyMode::Testing)) => "testing",
-            _ => "none",
-        };
+pub(super) struct AddressListLookup<'a> {
+    pub(super) stats: Option<AddressListStats>,
+    resolver: Option<&'a dyn Resolver>,
+    strategy: IpLookupStrategy,
+}
+
+impl AddressListLookup<'_> {
+    pub fn new(strategy: IpLookupStrategy) -> Self {
         Self {
-            provider,
-            discovery: SmtpDiscovery {
-                method: method.into(),
-                mta_sts: Some(mta_sts.into()),
-                dane: Some(
-                    if path.enable_dane {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                    .into(),
-                ),
-            },
-            address_list: None,
-            build_duration: None,
-            first_dial: None,
-            attempts: vec![],
-            attempt_count: 0,
-            tcp_candidates: 0,
-            failed: false,
-            socket: None,
+            stats: metrics::enabled().then(AddressListStats::default),
+            resolver: None,
+            strategy,
         }
     }
 
-    pub fn built(&mut self, stats: AddressListStats, candidates: usize) {
-        self.build_duration = stats.first_lookup.map(|start| start.elapsed());
-        let outcome = stats.outcome(candidates);
-        if let Some(duration) = self.build_duration {
-            metrics::address_list(outcome, duration);
-        }
-        self.address_list = Some(SmtpAddressList {
-            outcome: outcome.into(),
-            address_list_build_ms: self.build_duration.map(ms),
-            mx_hosts_looked_up: Some(stats.mx_hosts_looked_up as u64),
-            usable_ip_candidates: Some(candidates as u64),
+    pub async fn resolve_host(&mut self, name: &str) -> anyhow::Result<Vec<ResolvedAddress>> {
+        // resolve_a_or_aaaa handles literals and Unix sockets without a DNS lookup.
+        let mut stats = self.stats.as_mut().filter(|_| {
+            !name.starts_with('[') && name.parse::<kumo_address::host::HostAddress>().is_err()
         });
+        if let Some(stats) = &mut stats {
+            stats.start_lookup();
+        }
+        let resolved = resolve_a_or_aaaa(name, self.resolver, self.strategy).await?;
+        if let Some(stats) = stats {
+            stats.resolved_host(resolved.len());
+        }
+        Ok(resolved)
     }
 
-    pub fn new_socket(
+    pub async fn record(&self, dispatcher: &Dispatcher, addresses: &ResolvedMxAddresses) {
+        let (Some(stats), ResolvedMxAddresses::Addresses(list)) = (&self.stats, addresses) else {
+            return;
+        };
+        let elapsed = stats.first_lookup.map(|start| start.elapsed());
+        let outcome = stats.outcome(list.len());
+        if let Some(duration) = elapsed {
+            metrics::address_list(outcome, duration);
+        } else if !list.is_empty() {
+            return; // No lookup and no empty list to diagnose.
+        }
+        log_smtp_connection(
+            dispatcher.session_id,
+            &dispatcher.egress_source.name,
+            SmtpConnectionEvent::AddressList {
+                outcome: outcome.into(),
+                usable_ip_candidates: list.iter().filter(|a| a.addr.ip().is_some()).count() as u64,
+                address_list_build_ms: elapsed.map(ms),
+            },
+            list.is_empty(),
+            elapsed,
+        )
+        .await;
+    }
+
+    pub fn into_plan(self, dispatcher: &Dispatcher, config: &SmtpProtocol) -> Option<Box<Plan>> {
+        self.stats?;
+        let provider = match &dispatcher.mx {
+            Some(mx) => metrics::plan_provider(mx.hosts.iter().map(String::as_str)),
+            None => metrics::plan_provider(config.mx_list.iter().map(|entry| match entry {
+                MxListEntry::Name(name) => hostname(name),
+                MxListEntry::Resolved(addr) => &addr.name,
+            })),
+        };
+        Some(Box::new(Plan {
+            provider,
+            ..Plan::default()
+        }))
+    }
+}
+
+fn hostname(host: &str) -> &str {
+    has_colon_port(host).map_or(host, |(name, _)| name)
+}
+
+#[derive(Debug, Default)]
+pub(super) struct Plan {
+    provider: String,
+    setup_start: Option<Instant>,
+    tcp_candidates: usize,
+    attempt_number: u64,
+    socket: Option<Arc<SocketObserver>>,
+}
+
+impl SmtpDispatcher {
+    pub(super) fn socket_observer(&self) -> Option<&SocketObserver> {
+        self.telemetry.as_ref()?.socket.as_deref()
+    }
+
+    pub(super) fn take_socket_observer(&mut self) -> Option<Arc<SocketObserver>> {
+        self.telemetry.as_mut()?.socket.take()
+    }
+
+    pub(super) fn observe_candidate(
         &mut self,
-        address: &ResolvedAddress,
         dispatcher: &Dispatcher,
-    ) -> Arc<SocketObserver> {
-        let pref = dispatcher.mx.as_ref().and_then(|mx| {
-            mx.by_pref.iter().find_map(|(p, hosts)| {
+        address: &ResolvedAddress,
+    ) -> Option<Arc<SocketObserver>> {
+        let plan = self.telemetry.as_mut()?;
+        let pref = dispatcher.mx.as_ref().filter(|mx| mx.is_mx).and_then(|mx| {
+            let mut prefs = mx.by_pref.iter().filter_map(|(p, hosts)| {
                 hosts
                     .iter()
-                    .any(|h| {
-                        let host =
-                            dns_resolver::has_colon_port(h).map_or(h.as_str(), |(name, _)| name);
-                        host == address.name
-                    })
+                    .any(|h| hostname(h) == address.name)
                     .then_some(*p)
-            })
+            });
+            let pref = prefs.next()?;
+            // ResolvedAddress alone cannot distinguish two MX RRs for the same host.
+            prefs.next().is_none().then_some(pref)
         });
         let socket = Arc::new(SocketObserver {
             provider: metrics::provider(&address.name).into(),
@@ -132,180 +155,103 @@ impl Plan {
             preference: pref,
             state: Mutex::default(),
         });
-        self.socket = Some(socket.clone());
-        socket
+        plan.socket = Some(socket.clone());
+        Some(socket)
     }
 
     // Called immediately after the candidate result, before the ready queue can
     // try its successor. Cancellation is not a completed candidate or plan.
-    pub async fn attempt_result(&mut self, dispatcher: &Dispatcher, ready: bool, exhausted: bool) {
-        let end = Instant::now();
-        let Some(socket) = self.socket.clone() else {
-            // E.g. the final candidate failed local TLS certificate preparation
-            // before a socket could be attempted.
-            if exhausted && (self.attempt_count != 0 || self.address_list.is_some()) {
-                self.log(dispatcher, "exhausted", None, Some(end), true)
-                    .await;
-            }
-            return;
-        };
-        let (tcp, unix, phases, failed_phase, omitted, replies) = {
-            let mut state = socket.state.lock();
-            (
-                state.first_dial,
-                state.unix_dial,
-                std::mem::take(&mut state.phases),
-                state.failed_phase,
-                state.phases_omitted,
-                std::mem::take(&mut state.replies),
-            )
-        };
-        if let Some(start) = tcp {
-            self.first_dial.get_or_insert(start);
-            if self.tcp_candidates == 0 {
-                metrics::first_candidate(&socket.provider, ready);
-            }
-            self.tcp_candidates += 1;
-        }
-        let setup = self.first_dial.map(|start| end.duration_since(start));
-        let id = ready.then(|| socket.mark_ready(setup));
-        let refused = !replies.items.is_empty() || replies.omitted != 0;
-        self.failed |= !ready || refused || failed_phase;
-        if let Some(start) = tcp.or(unix) {
-            self.attempt_count += 1;
-            let record = SmtpSetupAttempt {
-                mx: socket.mx.clone(),
-                ip: socket.ip,
-                preference: socket.preference,
-                elapsed_ms: Some(ms(end.duration_since(start))),
-                outcome: if ready { "smtp_ready" } else { "failed" }.into(),
-                phases,
-                phases_omitted: None,
-            };
-            // Retain the final endpoint even when earlier attempts overflow. Do
-            // not call Lua between attempts or charge its time to SMTP setup.
-            if self.attempts.len() == MAX_ATTEMPTS {
-                self.attempts.pop();
-            }
-            self.attempts.push(Attempt {
-                record,
-                omitted,
-                replies,
-            });
-        }
-        if !ready {
-            self.socket.take();
-        }
-        if ready || exhausted {
-            let result = if !ready {
-                "exhausted"
-            } else if self.failed {
-                "recovered"
-            } else {
-                "ready"
-            };
-            self.log(dispatcher, result, id, Some(end), self.failed)
-                .await;
-        }
-    }
-
-    pub async fn log(
+    pub(super) async fn observe_attempt_result(
         &mut self,
         dispatcher: &Dispatcher,
-        result: &'static str,
-        id: Option<Uuid>,
-        end: Option<Instant>,
-        failed: bool,
+        result: &anyhow::Result<AttemptConnectionDisposition>,
     ) {
-        let duration = self
-            .first_dial
-            .take()
-            .zip(end)
-            .map(|(s, e)| e.duration_since(s));
-        if let Some(d) = duration {
-            metrics::setup(&self.provider, id.is_some(), self.tcp_candidates, d);
-        }
-        let mut attempts = vec![];
-        for attempt in std::mem::take(&mut self.attempts) {
-            attempts.push(attempt.record().await);
-        }
-        let record = SmtpConnectionPlan {
-            session_id: dispatcher.session_id,
-            connection_id: id,
-            egress_source: Some(dispatcher.egress_source.name.to_string()),
-            route: None,
-            result: result.into(),
-            discovery: Some(self.discovery.clone()),
-            address_list: self.address_list.take(),
-            connection_setup_ms: duration.map(ms),
-            attempts_omitted: Some((self.attempt_count - attempts.len()) as u64),
-            attempts,
+        let Some(plan) = &mut self.telemetry else {
+            return;
         };
-        self.attempt_count = 0;
-        self.tcp_candidates = 0;
-        self.failed = false;
-        log_smtp_connection_plan(record, failed, self.build_duration.take(), duration).await;
+        let ready = match result {
+            Ok(AttemptConnectionDisposition::ConnectedNew) => true,
+            Err(err) if !err.is::<ShuttingDownError>() => false,
+            _ => return,
+        };
+        let end = Instant::now();
+        let socket = if ready {
+            plan.socket.clone()
+        } else {
+            plan.socket.take()
+        };
+        let attempt = socket.and_then(|s| {
+            let start = s.state.lock().dial.take()?;
+            if s.ip.is_some() {
+                plan.setup_start.get_or_insert(start);
+                if plan.tcp_candidates == 0 {
+                    metrics::first_candidate(&s.provider, ready);
+                }
+                plan.tcp_candidates += 1;
+            }
+            plan.attempt_number += 1;
+            Some((s, end - start, plan.attempt_number))
+        });
+
+        let setup = plan.setup_start.map(|start| end - start);
+        if ready || self.addresses.is_empty() {
+            // A pre-dial failure can exhaust a plan that already tried an IP.
+            if let Some(elapsed) = setup {
+                metrics::setup(&plan.provider, ready, plan.tcp_candidates, elapsed);
+            }
+            plan.setup_start = None;
+            plan.tcp_candidates = 0;
+            plan.attempt_number = 0;
+        }
+        let Some((socket, elapsed, attempt_number)) = attempt else {
+            return;
+        };
+        let id = ready.then(|| socket.mark_ready(setup));
+        let (event, notable) = socket.attempt_event(attempt_number, elapsed, id).await;
+        log_smtp_connection(
+            dispatcher.session_id,
+            &dispatcher.egress_source.name,
+            event,
+            notable,
+            Some(elapsed),
+        )
+        .await;
+        // Await in wire order, without retaining prior endpoints or charging the
+        // classifier and logger queue wait between candidates to SMTP setup.
+        if let Some(start) = &mut plan.setup_start {
+            *start += end.elapsed();
+        }
+    }
+
+    pub(super) async fn observe_delivery(
+        &self,
+        responses: &[Response],
+        policy_veto: bool,
+    ) -> Option<Box<Transaction>> {
+        let socket = self.socket_observer()?;
+        Some(Box::new(
+            socket
+                .delivery(responses, policy_veto, self.client_address.as_ref())
+                .await,
+        ))
     }
 }
 
-#[derive(Debug)]
-struct Attempt {
-    record: SmtpSetupAttempt,
-    omitted: usize,
-    replies: Replies,
-}
-
-impl Attempt {
-    async fn record(mut self) -> SmtpSetupAttempt {
-        let phases = &mut self.record.phases;
-        self.omitted += self.replies.omitted;
-        for mut reply in self.replies.items {
-            let clean = reply.classify().await;
-            let phase = reply.stage.as_str();
-            if let Some(step) = phases
-                .get_mut(reply.phase_index)
-                .filter(|step| step.phase.as_str() == phase && step.response.is_none())
-            {
-                step.response = Some(clean);
-                step.failure_kind = Some("smtp_reply".into());
-            } else if phases.len() < MAX_PHASES {
-                phases.push(SmtpSetupPhase {
-                    phase: phase.into(),
-                    outcome: "error".into(),
-                    elapsed_ms: None,
-                    failure_kind: Some("smtp_reply".into()),
-                    response: Some(clean),
-                });
-            } else {
-                self.omitted += 1;
-            }
-        }
-        // Some local policy or setup errors occur between wire operations.
-        // Do not assign them to the last successful SMTP command.
-        if self.record.outcome.as_str() == "failed"
-            && !phases.iter().any(|step| step.outcome.as_str() == "error")
-        {
-            if phases.len() < MAX_PHASES {
-                phases.push(SmtpSetupPhase {
-                    phase: "other".into(),
-                    outcome: "error".into(),
-                    elapsed_ms: None,
-                    failure_kind: Some("local_error".into()),
-                    response: None,
-                });
-            } else {
-                self.omitted += 1;
-            }
-        }
-        self.record.phases_omitted = (self.omitted > 0).then_some(self.omitted as u64);
-        self.record
+pub(super) async fn connect_unix(
+    path: &std::path::Path,
+    observer: Option<&SocketObserver>,
+) -> std::io::Result<UnixStream> {
+    let timer = observer.map(|o| (o, Instant::now()));
+    let stream = UnixStream::connect(path).await;
+    if let Some((observer, start)) = timer {
+        observer.dial(start, stream.as_ref().map(|_| ()).map_err(|e| e.kind()));
     }
+    stream
 }
 
 struct PendingReply {
     provider: Arc<str>,
     stage: SmtpStage,
-    phase_index: usize,
     response: Response,
     truncated: bool,
     counted: bool,
@@ -324,17 +270,13 @@ impl PendingReply {
     }
 
     async fn classify(&mut self) -> SmtpPeerResponse {
-        if self.truncated {
-            self.response.content.clear();
-        }
-        // peer_reply increments after classification, with no subsequent await.
-        let mut clean =
-            metrics::peer_reply(&self.provider, self.stage.as_str(), &self.response).await;
+        let reason =
+            metrics::peer_reply(&self.provider, self.stage, &self.response, self.truncated).await;
         self.counted = true;
-        if self.truncated {
-            clean.content_truncated = Some(true);
-        }
-        clean
+        let mut reply = SmtpPeerResponse::new(self.response.code, self.response.enhanced_code)
+            .with_content(std::mem::take(&mut self.response.content), self.truncated);
+        reply.reason = reason.map(Into::into);
+        reply
     }
 }
 
@@ -343,7 +285,7 @@ impl Drop for PendingReply {
         // Covers unprocessed observations when the payload is capped or the
         // dispatcher shuts down before the classifier returns.
         if !self.counted {
-            metrics::peer_reply_unclassified(&self.provider, &self.response);
+            metrics::peer_reply_unclassified(&self.provider, self.response.code);
         }
     }
 }
@@ -354,12 +296,16 @@ struct Replies {
     omitted: usize,
 }
 
-impl std::fmt::Debug for Replies {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Replies")
-            .field("retained", &self.items.len())
-            .field("omitted", &self.omitted)
-            .finish()
+impl Replies {
+    async fn classify(self) -> Vec<SmtpPeerReply> {
+        let mut clean = Vec::with_capacity(self.items.len());
+        for mut reply in self.items {
+            clean.push(SmtpPeerReply {
+                smtp_stage: reply.stage.as_str().into(),
+                response: reply.classify().await,
+            });
+        }
+        clean
     }
 }
 
@@ -372,11 +318,8 @@ struct ReadySocket {
 
 #[derive(Default)]
 struct State {
-    first_dial: Option<Instant>,
-    unix_dial: Option<Instant>,
-    phases: Vec<SmtpSetupPhase>,
-    failed_phase: bool,
-    phases_omitted: usize,
+    dial: Option<Instant>,
+    setup_failure: Option<(&'static str, &'static str)>,
     ready: Option<ReadySocket>,
     terminal: Option<(SmtpStage, Option<SmtpFailureKind>, Option<Duration>)>,
     replies: Replies,
@@ -390,7 +333,7 @@ pub(super) struct SocketObserver {
     state: Mutex<State>,
 }
 
-// Do not expose buffered classifier input through dispatcher debug output.
+// Keep peer reply text in the configured file logs, not dispatcher debug output.
 impl std::fmt::Debug for SocketObserver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SocketObserver")
@@ -420,40 +363,60 @@ impl SocketObserver {
         id
     }
 
-    pub fn unix_dial(&self) {
-        self.state.lock().unix_dial = Some(Instant::now());
+    async fn attempt_event(
+        &self,
+        attempt_number: u64,
+        elapsed: Duration,
+        connection_id: Option<Uuid>,
+    ) -> (SmtpConnectionEvent, bool) {
+        let (failure, replies) = {
+            let mut state = self.state.lock();
+            (
+                state.setup_failure.take(),
+                std::mem::take(&mut state.replies),
+            )
+        };
+        let failed = connection_id.is_none();
+        let failure = failed.then(|| failure.unwrap_or(("other", "local_error")));
+        let notable = failed || !replies.items.is_empty();
+        let event = SmtpConnectionEvent::Attempt {
+            attempt_number,
+            mx: self.mx.clone(),
+            ip: self.ip,
+            preference: self.preference,
+            outcome: if failed { "failed" } else { "smtp_ready" }.into(),
+            elapsed_ms: ms(elapsed),
+            connection_id,
+            smtp_stage: failure.map(|(stage, _)| stage.into()),
+            failure_kind: failure.map(|(_, kind)| kind.into()),
+            peer_replies_omitted: (replies.omitted != 0).then_some(replies.omitted as u64),
+            peer_replies: replies.classify().await,
+        };
+        (event, notable)
     }
 
-    pub fn tcp(&self, start: Instant, result: Option<Result<(), ErrorKind>>) {
-        self.state.lock().first_dial.get_or_insert(start);
-        if let Some(result) = result {
-            self.phase(
-                "tcp_connect",
-                start.elapsed(),
-                result.err().map(|kind| match kind {
-                    ErrorKind::TimedOut => "connect_timeout",
-                    ErrorKind::ConnectionRefused => "connect_refused",
-                    _ => "connect_error",
-                }),
-            );
-        }
+    pub fn dial(&self, start: Instant, result: Result<(), ErrorKind>) {
+        self.state.lock().dial.get_or_insert(start);
+        self.phase(
+            if self.ip.is_some() {
+                "tcp_connect"
+            } else {
+                "unix_connect"
+            },
+            start.elapsed(),
+            result.err().map(|kind| match kind {
+                ErrorKind::TimedOut => "connect_timeout",
+                ErrorKind::ConnectionRefused => "connect_refused",
+                _ => "connect_error",
+            }),
+        );
     }
 
     fn phase(&self, phase: &'static str, duration: Duration, failure: Option<&'static str>) {
         metrics::phase(&self.provider, phase, failure.is_none(), duration);
-        let mut state = self.state.lock();
-        state.failed_phase |= failure.is_some();
-        if state.phases.len() < MAX_PHASES {
-            state.phases.push(SmtpSetupPhase {
-                phase: phase.into(),
-                elapsed_ms: Some(ms(duration)),
-                outcome: if failure.is_none() { "ok" } else { "error" }.into(),
-                failure_kind: failure.map(Into::into),
-                response: None,
-            });
-        } else {
-            state.phases_omitted += 1;
-        }
+        // A successful later operation supersedes a recovered failure. A local
+        // policy error after it must not be attributed to that wire operation.
+        self.state.lock().setup_failure = failure.map(|kind| (phase, kind));
     }
 
     pub async fn drain_idle(&self) {
@@ -463,7 +426,7 @@ impl SocketObserver {
         }
     }
 
-    pub async fn delivery(
+    async fn delivery(
         &self,
         responses: &[Response],
         policy_veto: bool,
@@ -502,51 +465,43 @@ impl SocketObserver {
                 fields.connection_setup_ms = setup.filter(|_| number == 1).map(ms);
             }
         }
-        let failure = terminal.and_then(|(stage, failure, _)| failure.map(|kind| (stage, kind)));
+        if let Some((stage, Some(kind), _)) = terminal {
+            fields.smtp_stage = Some(stage.as_str().into());
+            fields.failure_kind = Some(kind.as_str().into());
+        }
         // Match before any status rewrite. A successful final dot may coexist
         // with rejected RCPTs; their dispositions have individual primary replies.
         let per_recipient = responses
             .iter()
             .map(|response| {
                 let stage = match terminal {
-                    Some((stage, Some(SmtpFailureKind::SmtpReply), _)) => Some(stage),
+                    Some((stage, Some(SmtpFailureKind::SmtpReply), _)) => stage,
                     Some((_, None, Some(_)))
                         if response.is_transient() || response.is_permanent() =>
                     {
-                        Some(SmtpStage::RcptTo)
+                        SmtpStage::RcptTo
                     }
-                    _ => None,
+                    _ => return None,
                 };
-                let primary = stage.and_then(|s| {
-                    replies
-                        .items
-                        .iter()
-                        .position(|reply| reply.matches(s, response))
-                        .map(Primary::Retained)
-                        // Even beyond the payload cap, keep the numeric peer status
-                        // of this recipient, never its unchecked text or command.
-                        .or_else(|| {
-                            (replies.omitted != 0 && (400..600).contains(&response.code))
-                                .then_some(Primary::Omitted(response.code, response.enhanced_code))
-                        })
-                });
-                (stage, primary)
+                let primary = replies
+                    .items
+                    .iter()
+                    .position(|reply| reply.matches(stage, response))
+                    .map(Primary::Retained)
+                    // Beyond the capture limit, only the numeric status was retained.
+                    .or_else(|| {
+                        (replies.omitted != 0 && (400..600).contains(&response.code))
+                            .then_some(Primary::Omitted(response.code, response.enhanced_code))
+                    });
+                Some((stage, primary))
             })
             .collect();
-        let mut clean = vec![];
-        for mut reply in replies.items {
-            clean.push(SmtpPeerReply {
-                smtp_stage: reply.stage.as_str().into(),
-                response: reply.classify().await,
-            });
-        }
+        fields.peer_replies_omitted = (replies.omitted != 0).then_some(replies.omitted as u64);
+        fields.peer_replies = replies.classify().await;
         Transaction {
             peer_address: peer_address.cloned(),
             fields,
             per_recipient,
-            failure,
-            replies: clean,
-            omitted: replies.omitted,
         }
     }
 }
@@ -560,15 +515,13 @@ impl SmtpClientObserver for SocketObserver {
                 truncated,
             } => {
                 let mut state = self.state.lock();
-                let phase_index = state.phases.len();
                 if state.replies.items.len() == MAX_REPLIES {
                     state.replies.omitted += 1;
-                    metrics::peer_reply_unclassified(&self.provider, &response);
+                    metrics::peer_reply_unclassified(&self.provider, response.code);
                 } else {
                     state.replies.items.push(PendingReply {
                         provider: self.provider.clone(),
                         stage,
-                        phase_index,
                         response,
                         truncated,
                         counted: false,
@@ -613,56 +566,50 @@ enum Primary {
 }
 
 pub(crate) struct Transaction {
-    pub(crate) peer_address: Option<ResolvedAddress>,
+    peer_address: Option<ResolvedAddress>,
     fields: SmtpDispositionFields,
-    per_recipient: Vec<(Option<SmtpStage>, Option<Primary>)>,
-    failure: Option<(SmtpStage, SmtpFailureKind)>,
-    replies: Vec<SmtpPeerReply>,
-    omitted: usize,
+    per_recipient: Vec<Option<(SmtpStage, Option<Primary>)>>,
+}
+
+impl LogDisposition<'_> {
+    pub(super) async fn log_smtp_recipient(self, txn: Option<&Transaction>, recipient: usize) {
+        log_smtp_disposition(self, txn.map(|t| t.fields(recipient)), None).await;
+    }
+
+    // The ready queue's native error has no peer. Only local logs may use the saved address.
+    pub(crate) async fn log_smtp_internal_error(self, txn: Option<&Transaction>) {
+        let fields = txn.map(|t| SmtpDispositionFields {
+            smtp_stage: Some("other".into()),
+            failure_kind: Some("local_error".into()),
+            ..t.fields.clone()
+        });
+        log_smtp_disposition(self, fields, txn.and_then(|t| t.peer_address.as_ref())).await;
+    }
 }
 
 impl Transaction {
-    pub(crate) fn internal_error_fields(&self) -> SmtpDispositionFields {
-        SmtpDispositionFields {
-            smtp_stage: Some("other".into()),
-            failure_kind: Some("local_error".into()),
-            peer_replies: self.replies.clone(),
-            peer_replies_omitted: (self.omitted > 0).then_some(self.omitted as u64),
-            ..self.fields.clone()
-        }
-    }
-
-    pub fn fields(&self, recipient: usize) -> SmtpDispositionFields {
+    fn fields(&self, recipient: usize) -> SmtpDispositionFields {
         let mut fields = self.fields.clone();
-        let (stage, primary) = self.per_recipient[recipient];
-        if let Some((stage, kind)) = self
-            .failure
-            .or_else(|| stage.map(|s| (s, SmtpFailureKind::SmtpReply)))
-        {
+        let Some((stage, primary)) = self.per_recipient[recipient] else {
+            return fields;
+        };
+        if fields.failure_kind.is_none() {
             fields.smtp_stage = Some(stage.as_str().into());
-            fields.failure_kind = Some(kind.as_str().into());
+            fields.failure_kind = Some(SmtpFailureKind::SmtpReply.as_str().into());
         }
-        let mut omitted = self.omitted;
-        let primary_index = match primary {
+        match primary {
             Some(Primary::Retained(i)) => {
-                fields.peer_response = Some(self.replies[i].response.clone());
-                Some(i)
+                fields.peer_response = Some(fields.peer_replies.remove(i).response)
             }
             Some(Primary::Omitted(code, dsn)) => {
                 fields.peer_response = Some(SmtpPeerResponse::new(code, dsn));
-                omitted -= 1;
-                None
+                fields.peer_replies_omitted = fields
+                    .peer_replies_omitted
+                    .filter(|&n| n > 1)
+                    .map(|n| n - 1);
             }
-            None => None,
-        };
-        fields.peer_replies = self
-            .replies
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| (Some(i) != primary_index).then_some(r))
-            .cloned()
-            .collect();
-        fields.peer_replies_omitted = (omitted > 0).then_some(omitted as u64);
+            None => {}
+        }
         fields
     }
 }
@@ -705,6 +652,39 @@ mod test {
             stage,
             failure,
         });
+    }
+
+    #[tokio::test]
+    async fn recovered_setup_replies_stay_on_the_ready_attempt() {
+        let socket = socket();
+        for _ in 0..=MAX_REPLIES {
+            negative(&socket, SmtpStage::Ehlo, 450);
+        }
+        socket.phase("ehlo", Duration::ZERO, None);
+        let id = socket.mark_ready(None);
+        let (event, notable) = socket.attempt_event(2, Duration::ZERO, Some(id)).await;
+        let record = to_value(event).unwrap();
+        assert!(notable);
+        assert_eq!(record["outcome"], "smtp_ready");
+        assert_eq!(record["connection_id"], json!(id));
+        assert!(record.get("failure_kind").is_none());
+        assert_eq!(record["peer_replies"][0]["smtp_stage"], "ehlo");
+        assert_eq!(record["peer_replies"][0]["response"]["code"], 450);
+        assert_eq!(record["peer_replies_omitted"], 1);
+        assert!(socket.state.lock().replies.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_setup_error_does_not_blame_a_successful_command() {
+        let socket = socket();
+        socket.phase("ehlo", Duration::ZERO, None);
+        let (event, notable) = socket.attempt_event(1, Duration::ZERO, None).await;
+        let record = to_value(event).unwrap();
+        assert!(notable);
+        assert_eq!(record["smtp_stage"], "other");
+        assert_eq!(record["failure_kind"], "local_error");
+        assert!(record.get("peer_replies").is_none());
+        assert!(record.get("connection_id").is_none());
     }
 
     #[tokio::test]
@@ -755,6 +735,30 @@ mod test {
     }
 
     #[tokio::test]
+    async fn match_recipient_replies_before_clipping_the_log_text() {
+        let socket = socket();
+        let responses = [257, 256].map(|n| Response {
+            content: "x".repeat(n),
+            ..reply(450)
+        });
+        for response in &responses {
+            socket.observe(SmtpObservation::PeerReply {
+                stage: SmtpStage::RcptTo,
+                response: response.clone(),
+                truncated: false,
+            });
+        }
+        finish(&socket, SmtpStage::RcptTo, Some(SmtpFailureKind::SmtpReply));
+        let txn = socket.delivery(&responses, false, None).await;
+        // Same code and log prefix; only the first recipient's reply was clipped.
+        for (recipient, marker) in [Some(true), None].into_iter().enumerate() {
+            let primary = txn.fields(recipient).peer_response.unwrap();
+            assert_eq!(primary.content.unwrap().len(), 256);
+            assert_eq!(primary.content_truncated, marker);
+        }
+    }
+
+    #[tokio::test]
     async fn mixed_recipients_keep_their_own_primary_reply_across_payload_limit() {
         let socket = socket();
         socket.mark_ready(None);
@@ -792,7 +796,11 @@ mod test {
 
         let resolver = TestResolver::default().with_bogus("broken.example.");
         let mut addresses = vec![];
-        let mut stats = AddressListStats::default();
+        let mut lookup = AddressListLookup {
+            resolver: Some(&resolver),
+            strategy: IpLookupStrategy::Ipv4Only,
+            stats: Some(AddressListStats::default()),
+        };
         for entry in [
             MxListEntry::Name("[192.0.2.1]:2525".into()),
             MxListEntry::Name("/tmp/smtp.sock".into()),
@@ -803,17 +811,12 @@ mod test {
             }),
         ] {
             entry
-                .resolve_into(
-                    &mut addresses,
-                    Some(&resolver),
-                    IpLookupStrategy::Ipv4Only,
-                    10,
-                    Some(&mut stats),
-                )
+                .resolve_into(&mut addresses, &mut lookup, 10)
                 .await
                 .unwrap();
         }
         assert_eq!(addresses.len(), 3);
+        let stats = lookup.stats.as_ref().unwrap();
         assert_eq!(stats.mx_hosts_looked_up, 0);
         assert!(stats.first_lookup.is_none());
         assert_eq!(stats.outcome(addresses.len()), "complete");
@@ -821,16 +824,11 @@ mod test {
         // The failed DNS entry starts the timer; the local candidates still
         // make this a partial list, not a no-address result.
         MxListEntry::Name("broken.example.".into())
-            .resolve_into(
-                &mut addresses,
-                Some(&resolver),
-                IpLookupStrategy::Ipv4Only,
-                10,
-                Some(&mut stats),
-            )
+            .resolve_into(&mut addresses, &mut lookup, 10)
             .await
             .unwrap_err();
         assert_eq!(addresses.len(), 3);
+        let stats = lookup.stats.as_ref().unwrap();
         assert_eq!(stats.mx_hosts_looked_up, 1);
         assert!(stats.first_lookup.is_some());
         assert_eq!(stats.outcome(addresses.len()), "partial");

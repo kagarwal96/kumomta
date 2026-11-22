@@ -1,4 +1,5 @@
-use super::{ClientError, Command, Instant, Response};
+use super::{ClientError, Command, Instant, Response, SmtpClient, TlsOptions, TlsStatus};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(test)]
@@ -83,15 +84,14 @@ impl SmtpFailureKind {
     }
 }
 
-/// Structured observations from one client. No command arguments, envelope
-/// or message data are included. `PeerReply` text is untrusted classifier
-/// input; a consumer must apply its privacy policy before logging it.
+/// Structured observations from one client. `PeerReply` contains the parsed
+/// text sent by the peer; the client never attaches its own command arguments,
+/// envelope or message data.
 #[derive(Debug)]
 pub enum SmtpObservation {
     /// One complete negative reply, before disposition selection or rewrites.
-    /// The command is always absent. AUTH and unrecognized stages omit text.
-    /// Other text is limited to 1,024 UTF-8 bytes; `truncated` means the
-    /// prefix must not be treated as a complete reply for classification.
+    /// The command is always absent. Text is limited to 1,024 UTF-8 bytes.
+    /// A truncated prefix must not be used for classification.
     PeerReply {
         stage: SmtpStage,
         response: Response,
@@ -126,23 +126,16 @@ pub trait SmtpClientObserver: std::fmt::Debug + Send + Sync {
 impl SmtpObservation {
     pub(super) fn peer_reply(stage: SmtpStage, reply: &Response) -> Self {
         const MAX_PEER_TEXT: usize = 1024;
-        // A caller may have issued an unparsed command via Command::Unknown;
-        // in that case we cannot rule out a credential-bearing exchange.
-        let (content, truncated) = if matches!(stage, SmtpStage::Auth | SmtpStage::Other) {
-            (String::new(), false)
-        } else {
-            let end = reply.content.floor_char_boundary(MAX_PEER_TEXT);
-            (reply.content[..end].to_owned(), end < reply.content.len())
-        };
+        let end = reply.content.floor_char_boundary(MAX_PEER_TEXT);
         Self::PeerReply {
             stage,
             response: Response {
                 code: reply.code,
                 enhanced_code: reply.enhanced_code,
-                content,
+                content: reply.content[..end].to_owned(),
                 command: None,
             },
-            truncated,
+            truncated: end < reply.content.len(),
         }
     }
 }
@@ -152,8 +145,8 @@ impl SmtpObservation {
 /// results must not relabel a batch write as the first command's reply.
 #[derive(Clone)]
 pub(super) struct WireError {
-    pub stage: SmtpStage,
-    pub kind: SmtpFailureKind,
+    stage: SmtpStage,
+    kind: SmtpFailureKind,
     pub error: ClientError,
 }
 
@@ -181,29 +174,28 @@ impl WireError {
         Self { stage, kind, error }
     }
 
+    pub fn local_rejection(response: Response) -> Self {
+        Self::new(SmtpStage::Other, ClientError::Rejected(response))
+    }
+
     pub fn rejected(stage: SmtpStage, response: Response) -> Self {
         Self {
             stage,
-            kind: Self::reply_failure(&response),
+            kind: Self::reply_failure([&response]),
             error: ClientError::Rejected(response),
         }
     }
 
     pub fn rejected_batch(responses: Vec<Response>) -> Self {
-        let has_refusal = responses.iter().any(|r| (400..600).contains(&r.code));
         Self {
             stage: SmtpStage::RcptTo,
-            kind: if has_refusal {
-                SmtpFailureKind::SmtpReply
-            } else {
-                SmtpFailureKind::ProtocolError
-            },
+            kind: Self::reply_failure(&responses),
             error: ClientError::RejectedBatch(responses),
         }
     }
 
-    pub fn reply_failure(response: &Response) -> SmtpFailureKind {
-        if (400..600).contains(&response.code) {
+    fn reply_failure<'a>(replies: impl IntoIterator<Item = &'a Response>) -> SmtpFailureKind {
+        if replies.into_iter().any(|r| (400..600).contains(&r.code)) {
             SmtpFailureKind::SmtpReply
         } else {
             SmtpFailureKind::ProtocolError
@@ -211,14 +203,172 @@ impl WireError {
     }
 }
 
-#[derive(Default)]
-pub(super) struct TransactionTimer {
-    pub started: Option<Instant>,
-    pub finished: Option<Instant>,
+pub(super) enum TransactionTimer {
+    Disabled,
+    AwaitingMail,
+    Started {
+        started: Instant,
+        finished: Option<Instant>,
+    },
 }
 
 impl TransactionTimer {
+    pub fn start_mail(&mut self, client: &SmtpClient) {
+        if let (Self::AwaitingMail, Some(observer), Some(_)) =
+            (&*self, &client.observer, &client.socket)
+        {
+            *self = Self::Started {
+                started: Instant::now(),
+                finished: None,
+            };
+            observer.observe(SmtpObservation::MailFromStarted);
+        }
+    }
+
     pub fn mark_end(&mut self) {
-        self.finished = self.started.map(|_| Instant::now());
+        if let Self::Started { finished, .. } = self {
+            *finished = Some(Instant::now());
+        }
+    }
+
+    pub fn finish<T>(
+        self,
+        client: &SmtpClient,
+        result: Result<T, WireError>,
+    ) -> Result<T, ClientError> {
+        if let Some(observer) = &client.observer {
+            let error = result.as_ref().err();
+            if let Self::Started { started, finished } = self {
+                observer.observe(SmtpObservation::TransactionFinished {
+                    duration: finished.unwrap_or_else(Instant::now) - started,
+                    stage: error.map_or(SmtpStage::DataDot, |err| err.stage),
+                    failure: error.map(|err| err.kind),
+                });
+            } else if let (Self::AwaitingMail, Some(err)) = (self, error) {
+                observer.observe(SmtpObservation::BeforeMailFromFailure {
+                    stage: err.stage,
+                    failure: err.kind,
+                });
+            }
+        }
+        result.map_err(|err| err.error)
+    }
+}
+
+impl SmtpClient {
+    /// Enable or disable structured observations on this client. Independent
+    /// of the raw SMTP tracer; neither is enabled by default.
+    pub fn set_observer(&mut self, observer: Option<Arc<dyn SmtpClientObserver>>) {
+        self.observer = observer;
+    }
+
+    fn timer(&self) -> Option<Instant> {
+        self.observer.as_ref().map(|_| Instant::now())
+    }
+
+    pub(super) fn reply_timer(&self, expected: Option<u16>) -> Option<(Instant, u16)> {
+        expected.and_then(|code| self.timer().map(|started| (started, code)))
+    }
+
+    fn observe_phase(&self, stage: SmtpStage, started: Instant, failure: Option<SmtpFailureKind>) {
+        if let Some(observer) = &self.observer {
+            observer.observe(SmtpObservation::Phase {
+                stage,
+                duration: started.elapsed(),
+                failure,
+            });
+        }
+    }
+
+    pub(super) fn finish_reply_phase(
+        &self,
+        stage: SmtpStage,
+        timer: Option<(Instant, u16)>,
+        result: Result<Response, WireError>,
+    ) -> Result<Response, ClientError> {
+        if let Some((started, expected)) = timer {
+            let failure = match &result {
+                Err(err) => Some(err.kind),
+                Ok(reply) if reply.code != expected => Some(WireError::reply_failure([reply])),
+                Ok(_) => None,
+            };
+            self.observe_phase(stage, started, failure);
+        }
+        result.map_err(|err| err.error)
+    }
+
+    pub(super) async fn observe_tls(
+        &mut self,
+        options: TlsOptions,
+        upgrade_command: Option<&Command>,
+    ) -> Result<TlsStatus, ClientError> {
+        let started = self.timer();
+        let result = self.negotiate_tls(options, upgrade_command).await;
+        if let Some(started) = started {
+            let failure = match &result {
+                Ok(TlsStatus::Info(_)) => None,
+                Ok(TlsStatus::FailedHandshake(_)) => Some(SmtpFailureKind::TlsError),
+                Err(err) => Some(err.kind),
+            };
+            self.observe_phase(SmtpStage::StartTls, started, failure);
+        }
+        result.map_err(|err| err.error)
+    }
+
+    pub(super) async fn read_response_at(
+        &mut self,
+        command: Option<&Command>,
+        timeout_duration: Duration,
+        flush_stage: SmtpStage,
+    ) -> Result<Response, WireError> {
+        let deadline = Instant::now() + timeout_duration;
+        self.flush_request(command, timeout_duration, deadline)
+            .await
+            .map_err(|error| match error {
+                // Preserve the public error while attributing a flush timeout to the write.
+                ClientError::TimeOutResponse { .. } => WireError {
+                    stage: flush_stage,
+                    kind: SmtpFailureKind::WriteTimeout,
+                    error,
+                },
+                _ => WireError::new(flush_stage, error),
+            })?;
+        let stage = command.map_or(flush_stage, SmtpStage::from);
+        let response = self
+            .read_reply(command, deadline)
+            .await
+            .map_err(|err| WireError::new(stage, err))?;
+        if let Some(observer) = &self.observer {
+            if (400..600).contains(&response.code) {
+                observer.observe(SmtpObservation::peer_reply(stage, &response));
+            }
+        }
+        Ok(response)
+    }
+
+    pub(super) async fn write_mail_data(
+        &mut self,
+        data: &[u8],
+        timer: &mut TransactionTimer,
+    ) -> Result<(), WireError> {
+        self.write_data_with_timeout(data).await.map_err(|err| {
+            timer.mark_end();
+            WireError::new(SmtpStage::DataWrite, err)
+        })
+    }
+
+    pub(super) async fn read_data_dot(
+        &mut self,
+        timer: &mut TransactionTimer,
+    ) -> Result<Response, WireError> {
+        let reply = self
+            .read_response_at(
+                Some(&Command::DataDot),
+                self.timeouts.data_dot_timeout,
+                SmtpStage::DataWrite,
+            )
+            .await;
+        timer.mark_end();
+        reply
     }
 }

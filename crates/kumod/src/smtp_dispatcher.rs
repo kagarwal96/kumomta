@@ -1,14 +1,12 @@
 mod observations;
 
-use self::observations::Plan;
-pub(crate) use self::observations::Transaction;
+pub(crate) use self::observations::{resolve_smtp_mx, Transaction};
+use self::observations::{AddressListLookup, Plan};
 use crate::delivery_metrics::MetricsWrappedConnection;
 use crate::http_server::admin_trace_smtp_client_v1::{
     SmtpClientTraceEventPayload, SmtpClientTracerImpl,
 };
-use crate::logging::disposition::{
-    log_disposition, log_smtp_disposition, LogDisposition, RecordType,
-};
+use crate::logging::disposition::{LogDisposition, RecordType};
 use crate::queue::{IncrementAttempts, InsertReason, QueueManager, QueueState};
 use crate::ready_queue::{AttemptConnectionDisposition, Dispatcher, QueueDispatcher};
 use crate::spool::SpoolManager;
@@ -17,18 +15,14 @@ use async_trait::async_trait;
 use bounce_classify::{BounceClass, PreDefinedBounceClass};
 use config::{load_config, CallbackSignature};
 use data_loader::KeySource;
-use dns_resolver::{
-    has_colon_port, resolve_a_or_aaaa, DaneStatus, IpLookupStrategy, Resolver, SecureCnameStatus,
-};
+use dns_resolver::{has_colon_port, DaneStatus, SecureCnameStatus};
 use kumo_address::socket::SocketAddress;
 use kumo_api_types::egress_path::{EgressPathConfig, ReconnectStrategy, Tls, TlsMode};
 use kumo_log_types::{MaybeProxiedSourceAddress, ResolvedAddress};
 use kumo_prometheus::declare_metric;
 use kumo_server_lifecycle::{ShutdownSubcription, ShuttingDownError};
 use kumo_server_runtime::spawn;
-use mailexchanger::{
-    is_dane_enabled, AddressListStats, MailExchanger, PolicyMode, ResolvedMxAddresses,
-};
+use mailexchanger::{is_dane_enabled, PolicyMode, ResolvedMxAddresses};
 use message::message::QueueNameComponents;
 use message::Message;
 use rfc5321::parser::{EnvelopeAddress, ForwardPath, ReversePath};
@@ -42,8 +36,6 @@ use spool::SpoolId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::net::UnixStream;
 use tracing::Level;
 
 lruttl::declare_cache! {
@@ -144,13 +136,6 @@ pub enum MxListEntry {
 }
 
 impl MxListEntry {
-    fn hostname(&self) -> &str {
-        match self {
-            Self::Name(name) => has_colon_port(name).map_or(name, |(host, _)| host),
-            Self::Resolved(addr) => &addr.name,
-        }
-    }
-
     /// Resolve self into 1 or more `ResolvedAddress` and append to the supplied
     /// `addresses` vector. At most `max_addresses_per_host` addresses are
     /// appended for a name that resolves to an `A`/`AAAA` RRset, bounding the
@@ -158,30 +143,17 @@ impl MxListEntry {
     async fn resolve_into(
         &self,
         addresses: &mut Vec<ResolvedAddress>,
-        resolver: Option<&dyn Resolver>,
-        strategy: IpLookupStrategy,
+        lookup: &mut AddressListLookup<'_>,
         max_addresses_per_host: usize,
-        stats: Option<&mut AddressListStats>,
     ) -> anyhow::Result<()> {
         match self {
             Self::Name(a) => {
                 let (name, port) =
                     has_colon_port(a).map_or((a.as_str(), None), |(host, port)| (host, Some(port)));
-                // resolve_a_or_aaaa handles domain literals and Unix sockets
-                // locally; they are candidates, not DNS lookups.
-                let mut stats = stats.filter(|_| {
-                    !name.starts_with('[')
-                        && name.parse::<kumo_address::host::HostAddress>().is_err()
-                });
-                if let Some(stats) = &mut stats {
-                    stats.start_lookup();
-                }
-                let mut resolved = resolve_a_or_aaaa(name, resolver, strategy)
+                let mut resolved = lookup
+                    .resolve_host(name)
                     .await
                     .with_context(|| format!("resolving mx_list entry {a}"))?;
-                if let Some(stats) = stats {
-                    stats.resolved_host(resolved.len());
-                }
                 resolved.truncate(max_addresses_per_host);
                 if let Some(port) = port {
                     for r in &mut resolved {
@@ -226,17 +198,6 @@ pub struct SmtpDispatcher {
     recips_last_txn: HashMap<(SpoolId, ForwardPath), u8>,
 }
 
-/// Time actual outbound MX resolution, including time spent waiting for a
-/// cache hit. Its result can be shared across messages and connection plans.
-pub(crate) async fn resolve_smtp_mx(domain: &str) -> anyhow::Result<Arc<MailExchanger>> {
-    let start = crate::smtp_telemetry::enabled().then(Instant::now);
-    let resolved = MailExchanger::resolve(domain).await;
-    if let Some(start) = start {
-        crate::smtp_telemetry::phase("unknown", "mx_lookup", resolved.is_ok(), start.elapsed());
-    }
-    resolved
-}
-
 impl SmtpDispatcher {
     pub async fn init(
         dispatcher: &mut Dispatcher,
@@ -255,30 +216,29 @@ impl SmtpDispatcher {
         };
 
         let mut mx_list_errors = vec![];
-        let mut telemetry = crate::smtp_telemetry::enabled()
-            .then(|| Box::new(Plan::new(dispatcher, proto_config, &path_config)));
-        let mut stats = AddressListStats::default();
+        let mut lookup = AddressListLookup::new(path_config.ip_lookup_strategy);
 
         let addresses = if proto_config.mx_list.is_empty() {
-            let mx = dispatcher.mx.as_ref().expect("to have mx when doing smtp");
-            mx.resolve_addresses_with_stats(
-                None,
-                path_config.ip_lookup_strategy,
-                path_config.max_mx_plan_size,
-                path_config.max_mx_addresses_per_host,
-                telemetry.as_ref().map(|_| &mut stats),
-            )
-            .await
+            dispatcher
+                .mx
+                .as_ref()
+                .expect("to have mx when doing smtp")
+                .resolve_addresses_with_stats(
+                    None,
+                    path_config.ip_lookup_strategy,
+                    path_config.max_mx_plan_size,
+                    path_config.max_mx_addresses_per_host,
+                    lookup.stats.as_mut(),
+                )
+                .await
         } else {
             let mut addresses = vec![];
             for a in proto_config.mx_list.iter() {
                 if let Err(err) = a
                     .resolve_into(
                         &mut addresses,
-                        None,
-                        path_config.ip_lookup_strategy,
+                        &mut lookup,
                         path_config.max_mx_addresses_per_host,
-                        telemetry.as_ref().map(|_| &mut stats),
                     )
                     .await
                 {
@@ -297,9 +257,7 @@ impl SmtpDispatcher {
             ResolvedMxAddresses::Addresses(addresses)
         };
 
-        if let (Some(plan), ResolvedMxAddresses::Addresses(list)) = (&mut telemetry, &addresses) {
-            plan.built(stats, list.len());
-        }
+        lookup.record(dispatcher, &addresses).await;
 
         let tracer = Arc::new(SmtpClientTracerImpl::new(serde_json::json!({
             "egress_pool": dispatcher.egress_pool.to_string(),
@@ -334,9 +292,6 @@ impl SmtpDispatcher {
         };
 
         if addresses.is_empty() {
-            if let Some(plan) = &mut telemetry {
-                plan.log(dispatcher, "no_address", None, None, true).await;
-            }
             let content = if mx_list_errors.is_empty() {
                 "MX didn't resolve to any hosts".to_string()
             } else {
@@ -366,9 +321,6 @@ impl SmtpDispatcher {
         for addr in &addresses {
             if let Some(ip) = addr.addr.ip() {
                 if path_config.prohibited_hosts.contains(ip) {
-                    if let Some(plan) = &mut telemetry {
-                        plan.log(dispatcher, "prohibited", None, None, false).await;
-                    }
                     dispatcher
                         .bulk_ready_queue_operation(
                             Response {
@@ -398,9 +350,6 @@ impl SmtpDispatcher {
         });
 
         if addresses.is_empty() {
-            if let Some(plan) = &mut telemetry {
-                plan.log(dispatcher, "skipped", None, None, false).await;
-            }
             dispatcher
                 .bulk_ready_queue_operation(
                     Response {
@@ -422,7 +371,7 @@ impl SmtpDispatcher {
         }
 
         Ok(Some(Self {
-            telemetry,
+            telemetry: lookup.into_plan(dispatcher, proto_config),
             addresses,
             client: None,
             client_address: None,
@@ -461,9 +410,7 @@ impl SmtpDispatcher {
                         return Ok(AttemptConnectionDisposition::ReusedExisting);
                     }
                     Ok(Some(response)) => {
-                        if let Some(socket) =
-                            self.telemetry.as_ref().and_then(|p| p.socket.as_ref())
-                        {
+                        if let Some(socket) = self.socket_observer() {
                             socket.drain_idle().await;
                         }
                         // We got an explicit signal that the connection is closing
@@ -526,11 +473,8 @@ impl SmtpDispatcher {
             }
         }
 
-        // A stale client may still occupy the wrapper, but it cannot supply
-        // observations for this new (possibly pre-dial) attempt.
-        if let Some(plan) = &mut self.telemetry {
-            plan.socket.take();
-        }
+        // Even a pre-dial failure must not inherit the stale client's observations.
+        self.take_socket_observer();
 
         let mut shutdown = ShutdownSubcription::get();
 
@@ -655,10 +599,7 @@ impl SmtpDispatcher {
             TlsMode::StartTls => None,
         };
 
-        let observer = self
-            .telemetry
-            .as_mut()
-            .map(|plan| plan.new_socket(&address, dispatcher));
+        let observer = self.observe_candidate(dispatcher, &address);
         let make_connection: tokio::task::JoinHandle<anyhow::Result<ConnectedSession>> = {
             let target_address = target_address.clone();
             let address = address.clone();
@@ -675,24 +616,12 @@ impl SmtpDispatcher {
             tokio::spawn(async move {
                 let (mut client, source_address) = match address.addr.ip() {
                     Some(ip) => {
-                        let target = SocketAddr::new(ip, port);
-                        let (stream, source_address) = match &observer {
-                            Some(observer) => {
-                                let observe = |start, result| observer.tcp(start, result);
-                                egress_source
-                                    .connect_to_with_observer(
-                                        target,
-                                        timeouts.connect_timeout,
-                                        Some(&observe),
-                                    )
-                                    .await?
-                            }
-                            None => {
-                                egress_source
-                                    .connect_to(target, timeouts.connect_timeout)
-                                    .await?
-                            }
-                        };
+                        let dial = observer
+                            .as_ref()
+                            .map(|o| move |start, result| o.dial(start, result));
+                        let (stream, source_address) = egress_source
+                            .connect_to(SocketAddr::new(ip, port), timeouts.connect_timeout, dial)
+                            .await?;
                         tracing::debug!(
                             "connected to {target_address} via source address {source_address:?}"
                         );
@@ -708,10 +637,7 @@ impl SmtpDispatcher {
                             )
                         })?;
 
-                        if let Some(observer) = &observer {
-                            observer.unix_dial();
-                        }
-                        let stream = UnixStream::connect(&path).await?;
+                        let stream = observations::connect_unix(path, observer.as_deref()).await?;
 
                         let source_address = MaybeProxiedSourceAddress {
                             address: stream.local_addr()?.into(),
@@ -733,9 +659,7 @@ impl SmtpDispatcher {
                 tracer.set_meta("mx_address", address.addr.to_string());
                 tracer.submit(|| SmtpClientTraceEventPayload::Connected);
 
-                if let Some(observer) = observer {
-                    client.set_observer(Some(observer));
-                }
+                client.set_observer(observer.map(|o| o as _));
                 client.set_tracer(tracer);
                 client.set_enable_pipelining(enable_pipelining);
                 client.set_enable_rset(enable_rset);
@@ -1309,10 +1233,9 @@ impl SmtpDispatcher {
         msg: Message,
         recipient_list: Option<Vec<String>>,
         response: Response,
-        fields: Option<kumo_log_types::smtp::SmtpDispositionFields>,
+        first_recipient: usize,
     ) {
-        let config = dispatcher.path_config.borrow();
-        let args = LogDisposition {
+        LogDisposition {
             kind,
             msg,
             response,
@@ -1324,14 +1247,12 @@ impl SmtpDispatcher {
             delivery_protocol: Some(&dispatcher.delivery_protocol),
             tls_info: self.tls_info.as_ref(),
             source_address: self.source_address.clone(),
-            provider: config.provider_name.as_deref(),
+            provider: dispatcher.path_config.borrow().provider_name.as_deref(),
             session_id: Some(dispatcher.session_id),
             recipient_list,
-        };
-        match fields {
-            Some(fields) => log_smtp_disposition(args, fields, None).await,
-            None => log_disposition(args).await,
         }
+        .log_smtp_recipient(dispatcher.smtp_transaction.as_deref(), first_recipient)
+        .await
     }
 
     /// Prepare for a potential reconnect.
@@ -1352,9 +1273,7 @@ impl SmtpDispatcher {
             }
         }
         self.client.take();
-        if let Some(plan) = &mut self.telemetry {
-            plan.socket.take();
-        }
+        self.take_socket_observer();
 
         // We consider our session to be terminated with "success" if
         // we got as far as trying to send a message down any of them.
@@ -1379,7 +1298,7 @@ impl QueueDispatcher for SmtpDispatcher {
                 .send_command(&rfc5321::parser::Command::Quit)
                 .await
                 .ok();
-            if let Some(socket) = self.telemetry.as_mut().and_then(|plan| plan.socket.take()) {
+            if let Some(socket) = self.take_socket_observer() {
                 socket.drain_idle().await;
             }
             // Close out this dispatcher and let the maintainer spawn
@@ -1401,18 +1320,7 @@ impl QueueDispatcher for SmtpDispatcher {
         dispatcher: &mut Dispatcher,
     ) -> anyhow::Result<AttemptConnectionDisposition> {
         let result = self.attempt_connection_impl(dispatcher).await;
-        if let Some(plan) = &mut self.telemetry {
-            match &result {
-                Ok(AttemptConnectionDisposition::ConnectedNew) => {
-                    plan.attempt_result(dispatcher, true, false).await
-                }
-                Err(err) if !err.is::<ShuttingDownError>() => {
-                    plan.attempt_result(dispatcher, false, self.addresses.is_empty())
-                        .await
-                }
-                _ => {}
-            }
-        }
+        self.observe_attempt_result(dispatcher, &result).await;
         result.map_err(|err| {
             self.tracer.diagnostic(Level::ERROR, || format!("{err:#}"));
             err
@@ -1646,18 +1554,7 @@ impl QueueDispatcher for SmtpDispatcher {
             }
         }
 
-        dispatcher.smtp_transaction = match self
-            .telemetry
-            .as_ref()
-            .and_then(|plan| plan.socket.as_ref())
-        {
-            Some(socket) => Some(Box::new(
-                socket
-                    .delivery(&result_per_rcpt, policy_veto, self.client_address.as_ref())
-                    .await,
-            )),
-            None => None,
-        };
+        dispatcher.smtp_transaction = self.observe_delivery(&result_per_rcpt, policy_veto).await;
 
         if rewrite_eligible {
             let queue_name = msg.get_queue_name().await?;
@@ -1821,10 +1718,7 @@ impl QueueDispatcher for SmtpDispatcher {
                         .collect(),
                 ),
                 response,
-                dispatcher
-                    .smtp_transaction
-                    .as_ref()
-                    .map(|txn| txn.fields(entry.first_recipient)),
+                entry.first_recipient,
             )
             .await;
         }

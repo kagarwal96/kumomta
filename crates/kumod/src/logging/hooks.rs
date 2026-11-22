@@ -99,7 +99,7 @@ impl LogHookState {
                 }
                 // Connection diagnostics have no envelope and must never enter
                 // should_enqueue_log_record, even if misrouted here.
-                LogCommand::SmtpConnectionPlan(_) => continue,
+                LogCommand::SmtpConnection(_) => continue,
                 LogCommand::Record(record, _msg) => {
                     if let Err(err) = self.do_record(record).await {
                         tracing::error!("failed to log: {err:#}");

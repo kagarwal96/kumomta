@@ -21,13 +21,28 @@ local SMTP_TELEMETRY = os.getenv 'KUMOD_TEST_SMTP_TELEMETRY'
 if SMTP_TELEMETRY == 'classify' then
   kumo.on('smtp_client_classify_peer_reply', function(group, stage, reply)
     if stage == 'rcpt_to' then
-      if group == 'sink' and reply.content == 'tempfail requested' then
+      local dsn = reply.enhanced_code
+      if
+        group == 'sink'
+        and dsn
+        and reply.content
+        and (
+          (dsn.class == 4 and reply.content == 'tempfail requested')
+          or (dsn.class == 5 and reply.content:match ' retry later$')
+        )
+      then
+        -- Only the reason is used; this field must not replace the peer's text.
         return { reason = 'temporary', content = 'Retry later' }
       end
       return { reason = 'unlisted' }
     end
-    -- The pipelined DATA also fails. Callback errors must not expose its text.
-    error(reply.content)
+    if stage == 'auth' and reply.code == 535 and reply.content == nil then
+      local dsn = reply.enhanced_code
+      assert(dsn.class == 5 and dsn.subject == 7 and dsn.detail == 8)
+      return { reason = 'auth_failed' }
+    end
+    -- The pipelined DATA refusal is still counted and logged if classification fails.
+    error 'classifier failed'
   end)
 end
 
@@ -70,15 +85,19 @@ kumo.on('init', function()
   if SMTP_TELEMETRY then
     local policy = {
       providers = { sink = { 'localhost', 'workinghost' } },
-      reasons = { 'temporary' },
-      enhanced_codes = { '5.5.0' },
+      reasons = { 'temporary', 'auth_failed' },
     }
     kumo.configure_smtp_client_telemetry(policy)
     if SMTP_TELEMETRY == 'classify' then
       kumo.configure_smtp_client_telemetry(policy)
       assert(not pcall(kumo.configure_smtp_client_telemetry, {}))
     end
-    per_record = { SmtpConnectionPlan = { log_dir = TEST_DIR .. '/plans' } }
+    per_record = {
+      SmtpConnection = {
+        log_dir = TEST_DIR .. '/connections',
+        slow_threshold = os.getenv 'KUMOD_TEST_SMTP_SLOW_THRESHOLD',
+      },
+    }
   end
 
   kumo.configure_local_logs {

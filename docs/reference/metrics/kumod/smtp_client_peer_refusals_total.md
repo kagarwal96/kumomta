@@ -3,7 +3,7 @@
 
 ```
 Type: Counter
-Labels: destination_relay_group, smtp_code, dsn, reason
+Labels: destination_relay_group, smtp_code, reason
 ```
 Negative replies read from the SMTP peer, counted before disposition policy.
 
@@ -15,6 +15,6 @@ Negative replies read from the SMTP peer, counted before disposition policy.
     or domains, can have high cardinality.  High cardinality metrics may require
     some care and attention when provisioning a downstream metrics server.
 
-`smtp_code` is the peer's numeric reply code (400–599). For provider, DSN and reason
+`smtp_code` is the peer's numeric reply code (400–599). For provider and reason
 labels, see [kumo.configure_smtp_client_telemetry](../../kumo/configure_smtp_client_telemetry.md).
 

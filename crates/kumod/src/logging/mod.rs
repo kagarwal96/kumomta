@@ -2,13 +2,12 @@ use crate::logging::classify::{apply_classification, ClassifierParams};
 use crate::logging::disposition_hooks::{DispHookParams, RecordWrapper};
 use crate::logging::files::{LogFileParams, LogThreadState};
 use crate::logging::hooks::{LogHookParams, LogHookState};
+use crate::logging::smtp_client::ConnectionLog;
 use anyhow::Context;
 use bstr::ByteSlice;
 use camino::Utf8PathBuf;
-use chrono::Utc;
 use config::{any_err, from_lua_value, get_or_create_module, CallbackSignature};
 use flume::{bounded, Sender, TrySendError};
-use kumo_log_types::smtp::{SmtpConnectionPlan, SmtpConnectionPlanRecord};
 pub use kumo_log_types::*;
 use kumo_prometheus::declare_metric;
 use kumo_prometheus::prometheus::Histogram;
@@ -35,6 +34,7 @@ pub(crate) mod disposition_hooks;
 pub(crate) mod files;
 pub(crate) mod hooks;
 pub(crate) mod rejection;
+pub(crate) mod smtp_client;
 
 declare_metric! {
 /// how many times submission of a log event hit the back_pressure
@@ -79,7 +79,7 @@ pub struct LogRecordParams {
     #[serde(default)]
     pub template: Option<String>,
 
-    /// Minimum duration of either timer for a successful SmtpConnectionPlan.
+    /// Also log individual SmtpConnection events taking at least this long.
     #[serde(default, with = "duration_serde")]
     pub slow_threshold: Option<Duration>,
 
@@ -94,7 +94,7 @@ fn default_true() -> bool {
 
 pub(crate) enum LogCommand {
     Record(JsonLogRecord, Option<Message>),
-    SmtpConnectionPlan(Arc<SmtpConnectionPlanRecord>),
+    SmtpConnection(Arc<smtp::SmtpConnectionRecord>),
     Terminate,
 }
 
@@ -113,55 +113,13 @@ enum LoggerImpl {
     Immediate(Arc<CallbackSignature<(Message, RecordWrapper), ()>>),
 }
 
-/// Only local file loggers can acquire this explicit opt-in. In particular,
-/// `Any` must never be used to enable connection records.
-#[derive(Clone, Copy)]
-struct PlanLogSelection {
-    slow_threshold: Option<Duration>,
-}
-
-impl PlanLogSelection {
-    fn from_params(
-        per_record: &HashMap<RecordType, LogRecordParams>,
-        local: bool,
-    ) -> anyhow::Result<Option<Self>> {
-        let mut selection = None;
-        for (kind, params) in per_record {
-            if *kind == RecordType::SmtpConnectionPlan {
-                anyhow::ensure!(
-                    local,
-                    "SmtpConnectionPlan is only available in configure_local_logs"
-                );
-                if params.enable {
-                    selection = Some(Self {
-                        slow_threshold: params.slow_threshold,
-                    });
-                }
-            } else {
-                anyhow::ensure!(
-                    params.slow_threshold.is_none(),
-                    "slow_threshold is only supported for SmtpConnectionPlan"
-                );
-            }
-        }
-        Ok(selection)
-    }
-
-    fn should_log(self, failed: bool, build: Option<Duration>, setup: Option<Duration>) -> bool {
-        failed
-            || self.slow_threshold.is_some_and(|min| {
-                build.is_some_and(|d| d >= min) || setup.is_some_and(|d| d >= min)
-            })
-    }
-}
-
 pub struct Logger {
     implementation: LoggerImpl,
     meta: Vec<String>,
     headers: Vec<String>,
     enabled: HashMap<RecordType, bool>,
     filter_event: Option<String>,
-    plan_log: Option<PlanLogSelection>,
+    connection_log: Option<ConnectionLog>,
     hook_name: Option<String>,
     name: String,
     submit_latency: Histogram,
@@ -173,7 +131,7 @@ impl Logger {
     }
 
     pub async fn init_disp_hook(params: DispHookParams) -> anyhow::Result<()> {
-        PlanLogSelection::from_params(&params.per_record, false)?;
+        smtp_client::validate_config(&params.per_record, false)?;
         let mut loggers = LOGGER.lock();
 
         if loggers
@@ -203,7 +161,7 @@ impl Logger {
             meta: Default::default(),
             headers: Default::default(),
             enabled,
-            plan_log: None,
+            connection_log: None,
             filter_event: None,
             hook_name: Some(hook_name),
             name,
@@ -215,7 +173,7 @@ impl Logger {
     }
 
     pub async fn init_hook(params: LogHookParams) -> anyhow::Result<()> {
-        PlanLogSelection::from_params(&params.per_record, false)?;
+        smtp_client::validate_config(&params.per_record, false)?;
         let mut loggers = LOGGER.lock();
 
         if loggers
@@ -271,7 +229,7 @@ impl Logger {
             meta,
             headers,
             enabled,
-            plan_log: None,
+            connection_log: None,
             filter_event: None,
             hook_name: Some(hook_name),
             name,
@@ -283,7 +241,8 @@ impl Logger {
     }
 
     pub async fn init(params: LogFileParams) -> anyhow::Result<()> {
-        let plan_log = PlanLogSelection::from_params(&params.per_record, true)?;
+        smtp_client::validate_config(&params.per_record, true)?;
+        let connection_log = ConnectionLog::configured(&params.per_record);
         let mut template_engine = TemplateEngine::new();
 
         for (kind, per_rec) in &params.per_record {
@@ -353,7 +312,7 @@ impl Logger {
             headers,
             enabled,
             filter_event,
-            plan_log,
+            connection_log,
             hook_name: None,
             name,
             submit_latency,
@@ -364,8 +323,8 @@ impl Logger {
     }
 
     pub fn record_is_enabled(&self, kind: RecordType) -> bool {
-        if kind == RecordType::SmtpConnectionPlan {
-            return self.plan_log.is_some();
+        if kind == RecordType::SmtpConnection {
+            return self.connection_log.is_some();
         }
         if let Some(enabled) = self.enabled.get(&kind) {
             return *enabled;
@@ -412,8 +371,7 @@ impl Logger {
                 sender
                     .send_async(command)
                     .await
-                    .map_err(|_| anyhow::anyhow!("log channel was closed"))?;
-                Ok(())
+                    .map_err(|_| anyhow::anyhow!("log channel was closed"))
             }
             Err(TrySendError::Disconnected(_)) => anyhow::bail!("log channel was closed"),
         }
@@ -520,39 +478,6 @@ impl Logger {
     }
 }
 
-/// Emit one message-independent record to each interested local file logger.
-/// `failed` includes empty plans, failed attempts and recovered peer refusals.
-pub async fn log_smtp_connection_plan(
-    record: SmtpConnectionPlan,
-    failed: bool,
-    build: Option<Duration>,
-    setup: Option<Duration>,
-) {
-    let mut loggers = Logger::get_loggers()
-        .into_iter()
-        .filter(|logger| {
-            logger
-                .plan_log
-                .is_some_and(|selection| selection.should_log(failed, build, setup))
-        })
-        .peekable();
-    if loggers.peek().is_none() {
-        return;
-    }
-    let record = Arc::new(SmtpConnectionPlanRecord::new(Utc::now(), record));
-    for logger in loggers {
-        if let LoggerImpl::Queue { sender, .. } = &logger.implementation {
-            let _timer = logger.submit_latency.start_timer();
-            if let Err(err) = logger
-                .enqueue(sender, LogCommand::SmtpConnectionPlan(Arc::clone(&record)))
-                .await
-            {
-                tracing::error!("failed to enqueue SMTP connection plan: {err:#}");
-            }
-        }
-    }
-}
-
 /// Start monitoring `log_dir` for the backlog of consumers reading its
 /// segments. Invalid UTF-8 paths are logged and left unmonitored because the
 /// scanner accepts only `Utf8Path` directories. This does not fail
@@ -608,49 +533,4 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
     )?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn plan_requires_opt_in_on_each_local_logger() {
-        for config in [
-            json!({}),
-            json!({"Any": {"enable": true}}),
-            json!({"Any": {"enable": true}, "SmtpConnectionPlan": {"enable": false}}),
-        ] {
-            let params = serde_json::from_value(config).unwrap();
-            assert!(PlanLogSelection::from_params(&params, true)
-                .unwrap()
-                .is_none());
-        }
-        let params = serde_json::from_value(json!({"SmtpConnectionPlan": {}})).unwrap();
-        assert!(PlanLogSelection::from_params(&params, false).is_err());
-        let only_failures = PlanLogSelection::from_params(&params, true)
-            .unwrap()
-            .unwrap();
-        assert!(only_failures.should_log(true, None, None));
-        assert!(!only_failures.should_log(false, None, Some(Duration::from_secs(10))));
-        let invalid = serde_json::from_value(json!({"Any": {"slow_threshold": "1s"}})).unwrap();
-        assert!(PlanLogSelection::from_params(&invalid, true).is_err());
-    }
-
-    #[test]
-    fn plan_tests_each_measured_duration_against_inclusive_threshold() {
-        let params =
-            serde_json::from_value(json!({"SmtpConnectionPlan": {"slow_threshold": "2s"}}))
-                .unwrap();
-        let selection = PlanLogSelection::from_params(&params, true)
-            .unwrap()
-            .unwrap();
-        let short = Some(Duration::from_secs(1));
-        let threshold = Some(Duration::from_secs(2));
-        assert!(selection.should_log(false, threshold, None));
-        assert!(selection.should_log(false, None, threshold));
-        assert!(!selection.should_log(false, short, short));
-        assert!(!selection.should_log(false, None, None));
-    }
 }

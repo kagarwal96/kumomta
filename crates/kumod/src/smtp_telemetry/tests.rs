@@ -55,32 +55,8 @@ fn rejects_ambiguous_rules_and_unbounded_labels() {
         json!({"reasons": ["bad label"]}),
         json!({"reasons": ["a".repeat(49)]}),
         json!({"reasons": vec!["reason"; MAX_REASONS + 1]}),
-        json!({"enhanced_codes": vec!["4.7.1"; MAX_ENHANCED_CODES + 1]}),
-        json!({"enhanced_codes": ["4.7.1000"]}),
-        json!({"enhanced_codes": ["4.7.+1"]}),
-        json!({"enhanced_codes": ["5.007.1"]}),
-        json!({"enhanced_codes": ["2.0.0"]}),
     ] {
         assert!(policy(invalid.clone()).is_err(), "{invalid}");
-    }
-}
-
-#[test]
-fn distinguishes_unlisted_from_unusable_dsns() {
-    let p = policy(json!({"enhanced_codes": ["4.7.1"]})).unwrap();
-    for (code, message, expected) in [
-        (451, "4.7.1 listed", "4.7.1"),
-        (599, "5.8.2 unlisted", "other"),
-        (400, "no enhanced code", "unknown"),
-        (550, "4.7.1 mismatched class", "unknown"),
-        (451, "4.1000.1 invalid subject", "unknown"),
-        (451, "4.7.1000 invalid detail", "unknown"),
-    ] {
-        assert_eq!(
-            p.dsn(&Response::with_code_and_message(code, message)),
-            expected,
-            "{message}"
-        );
     }
 }
 
@@ -90,45 +66,41 @@ fn classifier_receives_no_command_or_sensitive_or_partial_text() {
         command: Some("RCPT TO:<private@example.invalid>".into()),
         ..Response::with_code_and_message(451, "4.7.1 retry later")
     };
-    let (stage, input, truncated) = classifier_input("rcpt_to", &response);
-    assert_eq!(stage, "rcpt_to");
-    assert!(!truncated);
+    let input = classifier_input(SmtpStage::RcptTo, &response, false);
     assert_eq!(
         serde_json::to_value(input).unwrap(),
         json!({
             "code":451, "enhanced_code":{"class":4,"subject":7,"detail":1}, "content":"retry later"
         })
     );
-    for (stage, expected) in [
-        ("auth", "auth"),
-        ("data_write", "data_write"),
-        ("pipeline", "pipeline"),
-        ("private arguments", "other"),
+    for stage in [
+        SmtpStage::Auth,
+        SmtpStage::DataWrite,
+        SmtpStage::Pipeline,
+        SmtpStage::Other,
     ] {
-        let (stage, input, _) = classifier_input(stage, &response);
-        assert_eq!(stage, expected);
+        let input = classifier_input(stage, &response, false);
         assert!(input.content.is_none());
     }
+    assert!(classifier_input(SmtpStage::DataDot, &response, true)
+        .content
+        .is_none());
     response.content = "x".repeat(MAX_CLASSIFIER_INPUT + 1);
-    let (_, input, truncated) = classifier_input("data_dot", &response);
-    assert!(truncated && input.content.is_none());
+    assert!(classifier_input(SmtpStage::DataDot, &response, false)
+        .content
+        .is_none());
 }
 
 #[test]
 fn classifier_output_is_typed_and_bounded() -> anyhow::Result<()> {
     let lua = Lua::new();
     let classify = |chunk: &str| lua.load(chunk).eval::<Classification>();
-    let result = classify("return {reason='limited', content=string.rep('x', 255) .. 'é'}")?;
+    let result = classify("return {reason='limited', content={ignored=true}}")?;
     assert_eq!(result.reason.as_deref(), Some("limited"));
-    assert_eq!(result.content, Some("x".repeat(255)));
-    assert!(result.truncated);
-    let result = classify(r"return {reason=string.rep('x', 49), content='line\nfeed'}")?;
-    assert!(result.reason.is_none() && result.content.is_none());
-    for invalid in [
-        "return 'peer text'",
-        "return {reason={}}",
-        "return {content={}}",
-    ] {
+    assert!(classify("return {reason=string.rep('x', 49)}")?
+        .reason
+        .is_none());
+    for invalid in ["return 'peer text'", "return {reason={}}"] {
         assert!(classify(invalid).is_err(), "{invalid}");
     }
     Ok(())

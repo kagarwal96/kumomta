@@ -14,7 +14,10 @@ use tokio::io::{
 // An in-memory socket with bounded buffers. A peer that neither answers nor
 // drains its side produces a real read or write timeout, without network I/O.
 #[derive(Debug)]
-struct Socket(DuplexStream);
+struct Socket {
+    wire: DuplexStream,
+    flushes_before_stall: Option<usize>,
+}
 impl AsyncReadAndWrite for Socket {}
 impl AsyncRead for Socket {
     fn poll_read(
@@ -22,7 +25,7 @@ impl AsyncRead for Socket {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
+        Pin::new(&mut self.wire).poll_read(cx, buf)
     }
 }
 impl AsyncWrite for Socket {
@@ -31,13 +34,19 @@ impl AsyncWrite for Socket {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
+        Pin::new(&mut self.wire).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
+        if let Some(remaining) = &mut self.flushes_before_stall {
+            if *remaining == 0 {
+                return Poll::Pending;
+            }
+            *remaining -= 1;
+        }
+        Pin::new(&mut self.wire).poll_flush(cx)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
+        Pin::new(&mut self.wire).poll_shutdown(cx)
     }
 }
 
@@ -55,9 +64,20 @@ impl Events {
 }
 
 fn fixture(buffer: usize) -> (SmtpClient, DuplexStream, Arc<Events>) {
+    socket_fixture(buffer, None)
+}
+
+fn socket_fixture(
+    buffer: usize,
+    flushes_before_stall: Option<usize>,
+) -> (SmtpClient, DuplexStream, Arc<Events>) {
     let (wire, peer) = duplex(buffer);
     let timeouts = SmtpClientTimeouts::short_timeouts();
-    let mut client = SmtpClient::with_stream(Socket(wire), "mx.example", timeouts);
+    let socket = Socket {
+        wire,
+        flushes_before_stall,
+    };
+    let mut client = SmtpClient::with_stream(socket, "mx.example", timeouts);
     let events = Arc::new(Events::default());
     client.set_observer(Some(events.clone()));
     (client, peer, events)
@@ -178,9 +198,12 @@ async fn local_preflight_rejection_is_not_a_peer_reply_or_a_mail_attempt() {
     ));
 }
 
-#[tokio::test]
-async fn final_dot_read_timeout_is_not_a_peer_refusal() {
-    let (mut client, mut peer, events) = fixture(4096);
+async fn assert_final_dot_timeout(
+    flushes_before_stall: Option<usize>,
+    expected_stage: SmtpStage,
+    expected_failure: SmtpFailureKind,
+) {
+    let (mut client, mut peer, events) = socket_fixture(4096, flushes_before_stall);
     client.timeouts.data_dot_timeout = Duration::ZERO;
     peer.write_all(b"250 sender\r\n250 recipient\r\n354 go\r\n")
         .await
@@ -197,12 +220,23 @@ async fn final_dot_read_timeout_is_not_a_peer_refusal() {
         [
             SmtpObservation::MailFromStarted,
             SmtpObservation::TransactionFinished {
-                stage: SmtpStage::DataDot,
-                failure: Some(SmtpFailureKind::ResponseTimeout),
+                stage,
+                failure: Some(kind),
                 ..
             }
-        ]
+        ] if *stage == expected_stage && *kind == expected_failure
     ));
+}
+
+#[tokio::test]
+async fn final_dot_read_timeout_is_not_a_peer_refusal() {
+    assert_final_dot_timeout(None, SmtpStage::DataDot, SmtpFailureKind::ResponseTimeout).await;
+}
+
+#[tokio::test]
+async fn final_dot_flush_timeout_keeps_public_error_but_reports_a_data_write_failure() {
+    // MAIL, RCPT and DATA flush; the flush after the final dot stalls.
+    assert_final_dot_timeout(Some(3), SmtpStage::DataWrite, SmtpFailureKind::WriteTimeout).await;
 }
 
 #[tokio::test]
@@ -286,9 +320,9 @@ async fn disconnect_at_sequential_rset_does_not_start_a_transaction() {
 }
 
 #[tokio::test]
-async fn auth_observation_never_exposes_command_or_peer_text() {
+async fn auth_observation_keeps_the_reply_but_not_the_command() {
     let (mut client, mut peer, events) = fixture(4096);
-    peer.write_all(b"535 5.7.8 echoed password\r\n")
+    peer.write_all(b"535 5.7.8 Authentication credentials invalid\r\n")
         .await
         .unwrap();
     assert!(client
@@ -298,7 +332,7 @@ async fn auth_observation_never_exposes_command_or_peer_text() {
     assert!(matches!(events.take().as_slice(), [
         SmtpObservation::PeerReply {stage: SmtpStage::Auth, response, ..},
         SmtpObservation::Phase {stage: SmtpStage::Auth, failure: Some(SmtpFailureKind::SmtpReply), ..},
-    ] if response.code == 535 && response.content.is_empty() && response.command.is_none()));
+    ] if response.code == 535 && response.content == "Authentication credentials invalid" && response.command.is_none()));
 }
 
 #[tokio::test]

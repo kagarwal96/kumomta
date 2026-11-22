@@ -81,7 +81,7 @@ pub enum RecordType {
     XferIn,
 
     /// A local connection diagnostic, not a message disposition.
-    SmtpConnectionPlan,
+    SmtpConnection,
 
     /// Special for matching anything in the logging config
     Any,
@@ -97,7 +97,7 @@ impl RecordType {
         match self {
             Self::Any
             | Self::Reception
-            | Self::SmtpConnectionPlan
+            | Self::SmtpConnection
             | Self::Delivery
             | Self::DeferredInjectionRebind
             | Self::AdminRebind
@@ -305,9 +305,9 @@ pub struct JsonLogRecord {
 
 fn disposition_kind<'de, D: serde::Deserializer<'de>>(d: D) -> Result<RecordType, D::Error> {
     let kind = RecordType::deserialize(d)?;
-    if kind == RecordType::SmtpConnectionPlan {
+    if kind == RecordType::SmtpConnection {
         return Err(serde::de::Error::custom(
-            "SmtpConnectionPlan is not a disposition",
+            "SmtpConnection is not a disposition",
         ));
     }
     Ok(kind)
