@@ -22,7 +22,7 @@ use kumo_log_types::{MaybeProxiedSourceAddress, ResolvedAddress};
 use kumo_prometheus::declare_metric;
 use kumo_server_lifecycle::{ShutdownSubcription, ShuttingDownError};
 use kumo_server_runtime::spawn;
-use mailexchanger::{is_dane_enabled, PolicyMode, ResolvedMxAddresses};
+use mailexchanger::{is_dane_enabled, MailExchanger, PolicyMode, ResolvedMxAddresses};
 use message::message::QueueNameComponents;
 use message::Message;
 use rfc5321::parser::{EnvelopeAddress, ForwardPath, ReversePath};
@@ -257,7 +257,7 @@ impl SmtpDispatcher {
             ResolvedMxAddresses::Addresses(addresses)
         };
 
-        lookup.record(dispatcher, &addresses).await;
+        lookup.record(dispatcher, &addresses);
 
         let tracer = Arc::new(SmtpClientTracerImpl::new(serde_json::json!({
             "egress_pool": dispatcher.egress_pool.to_string(),
@@ -371,7 +371,7 @@ impl SmtpDispatcher {
         }
 
         Ok(Some(Self {
-            telemetry: lookup.into_plan(dispatcher, proto_config),
+            telemetry: lookup.into_plan(&addresses),
             addresses,
             client: None,
             client_address: None,
@@ -1198,7 +1198,7 @@ impl SmtpDispatcher {
         });
         let mta_sts = match pinned {
             Some(mx) => mx.mta_sts,
-            None => match resolve_smtp_mx(routing_domain).await {
+            None => match MailExchanger::resolve(routing_domain).await {
                 Ok(mx) => mx.mta_sts,
                 // Without a definitive policy we do not synthesize a veto.
                 Err(_) => return Ok(None),
@@ -1554,7 +1554,14 @@ impl QueueDispatcher for SmtpDispatcher {
             }
         }
 
-        dispatcher.smtp_transaction = self.observe_delivery(&result_per_rcpt, policy_veto).await;
+        // A whole-message internal error must not attribute this transaction to unsent recipients.
+        let whole_message_peer = self
+            .client_address
+            .as_ref()
+            .filter(|_| revised_recipient_list.is_empty());
+        dispatcher.smtp_transaction = self
+            .observe_delivery(&result_per_rcpt, policy_veto, whole_message_peer)
+            .await;
 
         if rewrite_eligible {
             let queue_name = msg.get_queue_name().await?;

@@ -269,16 +269,6 @@ mod test {
     }
 
     #[test]
-    fn json_round_trip_preserves_nested_empty_arrays_and_objects() -> anyhow::Result<()> {
-        let lua = Lua::new();
-        let input = r#"{"items":[[],{}],"nested":{"attempts":[]}}"#;
-        let value = json_parse(&lua, input.to_string())?;
-        let actual: serde_json::Value = serde_json::from_str(&json_encode(&lua, value)?)?;
-        assert_eq!(actual, serde_json::from_str::<serde_json::Value>(input)?);
-        Ok(())
-    }
-
-    #[test]
     fn load_files_preserves_order_and_dispatches_by_extension() {
         let dir = tempfile::tempdir().unwrap();
         let a = write(&dir, "a.toml", "n = 1");

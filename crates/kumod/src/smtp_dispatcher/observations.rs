@@ -1,6 +1,6 @@
 //! Outbound observations are separate from delivery decisions. A plan may span
 //! several sockets; only a socket that reached SMTP-ready has a connection ID.
-use super::{Dispatcher, MxListEntry, SmtpDispatcher, SmtpProtocol};
+use super::{Dispatcher, SmtpDispatcher};
 use crate::logging::disposition::{log_smtp_disposition, LogDisposition};
 use crate::logging::smtp_client::log_smtp_connection;
 use crate::ready_queue::AttemptConnectionDisposition;
@@ -32,7 +32,7 @@ fn ms(d: Duration) -> f64 {
 pub(crate) async fn resolve_smtp_mx(domain: &str) -> anyhow::Result<Arc<MailExchanger>> {
     let start = metrics::enabled().then(Instant::now);
     let resolved = MailExchanger::resolve(domain).await;
-    if let Some(start) = start {
+    if let Some(start) = start.filter(|_| !resolved.as_ref().is_ok_and(|mx| mx.is_domain_literal)) {
         metrics::phase("unknown", "mx_lookup", resolved.is_ok(), start.elapsed());
     }
     resolved
@@ -68,7 +68,7 @@ impl AddressListLookup<'_> {
         Ok(resolved)
     }
 
-    pub async fn record(&self, dispatcher: &Dispatcher, addresses: &ResolvedMxAddresses) {
+    pub fn record(&self, dispatcher: &Dispatcher, addresses: &ResolvedMxAddresses) {
         let (Some(stats), ResolvedMxAddresses::Addresses(list)) = (&self.stats, addresses) else {
             return;
         };
@@ -89,21 +89,13 @@ impl AddressListLookup<'_> {
             },
             list.is_empty(),
             elapsed,
-        )
-        .await;
+        );
     }
 
-    pub fn into_plan(self, dispatcher: &Dispatcher, config: &SmtpProtocol) -> Option<Box<Plan>> {
+    pub fn into_plan(self, addresses: &[ResolvedAddress]) -> Option<Box<Plan>> {
         self.stats?;
-        let provider = match &dispatcher.mx {
-            Some(mx) => metrics::plan_provider(mx.hosts.iter().map(String::as_str)),
-            None => metrics::plan_provider(config.mx_list.iter().map(|entry| match entry {
-                MxListEntry::Name(name) => hostname(name),
-                MxListEntry::Resolved(addr) => &addr.name,
-            })),
-        };
         Some(Box::new(Plan {
-            provider,
+            provider: metrics::plan_provider(addresses.iter().map(|addr| addr.name.as_str())),
             ..Plan::default()
         }))
     }
@@ -214,10 +206,8 @@ impl SmtpDispatcher {
             event,
             notable,
             Some(elapsed),
-        )
-        .await;
-        // Await in wire order, without retaining prior endpoints or charging the
-        // classifier and logger queue wait between candidates to SMTP setup.
+        );
+        // Exclude time spent classifying and submitting diagnostics between candidates.
         if let Some(start) = &mut plan.setup_start {
             *start += end.elapsed();
         }
@@ -227,11 +217,12 @@ impl SmtpDispatcher {
         &self,
         responses: &[Response],
         policy_veto: bool,
+        whole_message_peer: Option<&ResolvedAddress>,
     ) -> Option<Box<Transaction>> {
         let socket = self.socket_observer()?;
         Some(Box::new(
             socket
-                .delivery(responses, policy_veto, self.client_address.as_ref())
+                .delivery(responses, policy_veto, whole_message_peer)
                 .await,
         ))
     }
@@ -258,17 +249,6 @@ struct PendingReply {
 }
 
 impl PendingReply {
-    fn matches(&self, stage: SmtpStage, native: &Response) -> bool {
-        self.stage == stage
-            && self.response.code == native.code
-            && self.response.enhanced_code == native.enhanced_code
-            && (if self.truncated {
-                native.content.starts_with(&self.response.content)
-            } else {
-                native.content == self.response.content
-            })
-    }
-
     async fn classify(&mut self) -> SmtpPeerResponse {
         let reason =
             metrics::peer_reply(&self.provider, self.stage, &self.response, self.truncated).await;
@@ -430,7 +410,7 @@ impl SocketObserver {
         &self,
         responses: &[Response],
         policy_veto: bool,
-        peer_address: Option<&ResolvedAddress>,
+        whole_message_peer: Option<&ResolvedAddress>,
     ) -> Transaction {
         let (terminal, ready, replies) = {
             let mut state = self.state.lock();
@@ -469,37 +449,39 @@ impl SocketObserver {
             fields.smtp_stage = Some(stage.as_str().into());
             fields.failure_kind = Some(kind.as_str().into());
         }
-        // Match before any status rewrite. A successful final dot may coexist
-        // with rejected RCPTs; their dispositions have individual primary replies.
+        let primary_stage = match terminal {
+            Some((stage, Some(SmtpFailureKind::SmtpReply), _)) => Some(stage),
+            Some((_, None, Some(_))) => Some(SmtpStage::RcptTo),
+            _ => None,
+        };
+        let mut next_slot = 0;
         let per_recipient = responses
             .iter()
             .map(|response| {
-                let stage = match terminal {
-                    Some((stage, Some(SmtpFailureKind::SmtpReply), _)) => stage,
-                    Some((_, None, Some(_)))
-                        if response.is_transient() || response.is_permanent() =>
-                    {
-                        SmtpStage::RcptTo
-                    }
-                    _ => return None,
+                let stage = primary_stage?;
+                if !(400..600).contains(&response.code) {
+                    return None;
+                }
+                // Before rewrite, negative RCPT results and their observations have the
+                // same wire order. A global failure (including DATA dot) instead supplies
+                // one primary for the whole batch; its RCPT refusals stay secondary.
+                let slot =
+                    (next_slot..replies.items.len()).find(|&i| replies.items[i].stage == stage);
+                let primary = if let Some(i) = slot {
+                    next_slot = i + usize::from(stage == SmtpStage::RcptTo);
+                    Some(Primary::Retained(i))
+                } else {
+                    next_slot = replies.items.len();
+                    (replies.omitted != 0)
+                        .then_some(Primary::Omitted(response.code, response.enhanced_code))
                 };
-                let primary = replies
-                    .items
-                    .iter()
-                    .position(|reply| reply.matches(stage, response))
-                    .map(Primary::Retained)
-                    // Beyond the capture limit, only the numeric status was retained.
-                    .or_else(|| {
-                        (replies.omitted != 0 && (400..600).contains(&response.code))
-                            .then_some(Primary::Omitted(response.code, response.enhanced_code))
-                    });
                 Some((stage, primary))
             })
             .collect();
         fields.peer_replies_omitted = (replies.omitted != 0).then_some(replies.omitted as u64);
         fields.peer_replies = replies.classify().await;
         Transaction {
-            peer_address: peer_address.cloned(),
+            whole_message_peer: whole_message_peer.cloned(),
             fields,
             per_recipient,
         }
@@ -566,7 +548,7 @@ enum Primary {
 }
 
 pub(crate) struct Transaction {
-    peer_address: Option<ResolvedAddress>,
+    whole_message_peer: Option<ResolvedAddress>,
     fields: SmtpDispositionFields,
     per_recipient: Vec<Option<(SmtpStage, Option<Primary>)>>,
 }
@@ -578,16 +560,22 @@ impl LogDisposition<'_> {
 
     // The ready queue's native error has no peer. Only local logs may use the saved address.
     pub(crate) async fn log_smtp_internal_error(self, txn: Option<&Transaction>) {
-        let fields = txn.map(|t| SmtpDispositionFields {
-            smtp_stage: Some("other".into()),
-            failure_kind: Some("local_error".into()),
-            ..t.fields.clone()
-        });
-        log_smtp_disposition(self, fields, txn.and_then(|t| t.peer_address.as_ref())).await;
+        let (fields, peer) = txn.and_then(Transaction::whole_message_error).unzip();
+        log_smtp_disposition(self, fields, peer).await;
     }
 }
 
 impl Transaction {
+    fn whole_message_error(&self) -> Option<(SmtpDispositionFields, &ResolvedAddress)> {
+        let peer = self.whole_message_peer.as_ref()?;
+        let fields = SmtpDispositionFields {
+            smtp_stage: Some("other".into()),
+            failure_kind: Some("local_error".into()),
+            ..self.fields.clone()
+        };
+        Some((fields, peer))
+    }
+
     fn fields(&self, recipient: usize) -> SmtpDispositionFields {
         let mut fields = self.fields.clone();
         let Some((stage, primary)) = self.per_recipient[recipient] else {
@@ -699,7 +687,16 @@ mod test {
             SmtpStage::MailFrom,
             Some(SmtpFailureKind::SmtpReply),
         );
-        let first = to_value(socket.delivery(&[reply(450)], false, None).await.fields(0)).unwrap();
+        let peer = ResolvedAddress {
+            name: "mx.example".into(),
+            addr: "192.0.2.1".parse().unwrap(),
+            is_secure: false,
+        };
+        let txn = socket.delivery(&[reply(450)], false, Some(&peer)).await;
+        let (local, saved_peer) = txn.whole_message_error().unwrap();
+        assert_eq!(saved_peer, &peer);
+        assert_eq!(local.failure_kind.unwrap().as_str(), "local_error");
+        let first = to_value(txn.fields(0)).unwrap();
         assert_eq!(first["connection_id"], json!(id));
         assert_eq!(first["connection_setup_ms"], 7.0);
         assert_eq!(first["transaction_elapsed_ms"], 3.0);
@@ -711,7 +708,10 @@ mod test {
 
         socket.observe(SmtpObservation::MailFromStarted);
         finish(&socket, SmtpStage::DataDot, None);
-        let reused = to_value(socket.delivery(&[reply(250)], false, None).await.fields(0)).unwrap();
+        let txn = socket.delivery(&[reply(250)], false, None).await;
+        // A partial batch still has per-recipient diagnostics, but not for a whole-message error.
+        assert!(txn.whole_message_error().is_none());
+        let reused = to_value(txn.fields(0)).unwrap();
         assert_eq!(reused["connection_id"], json!(id));
         assert_eq!(reused["transaction_number"], 2);
         assert_eq!(reused["transaction_elapsed_ms"], 3.0);
@@ -735,63 +735,73 @@ mod test {
     }
 
     #[tokio::test]
-    async fn match_recipient_replies_before_clipping_the_log_text() {
+    async fn mixed_recipients_keep_their_own_primary_reply_across_payload_limit() {
         let socket = socket();
-        let responses = [257, 256].map(|n| Response {
-            content: "x".repeat(n),
-            ..reply(450)
-        });
-        for response in &responses {
+        socket.mark_ready(None);
+        socket.observe(SmtpObservation::MailFromStarted);
+        let busy = Response::with_code_and_message(450, "4.3.1 busy");
+        let mut responses = vec![busy.clone(); MAX_REPLIES + 2];
+        responses[1] = reply(250);
+        responses[2].content = "try later".into();
+        for response in responses.iter().filter(|r| r.is_transient()) {
             socket.observe(SmtpObservation::PeerReply {
                 stage: SmtpStage::RcptTo,
                 response: response.clone(),
                 truncated: false,
             });
         }
-        finish(&socket, SmtpStage::RcptTo, Some(SmtpFailureKind::SmtpReply));
+        finish(&socket, SmtpStage::DataDot, None);
         let txn = socket.delivery(&responses, false, None).await;
-        // Same code and log prefix; only the first recipient's reply was clipped.
-        for (recipient, marker) in [Some(true), None].into_iter().enumerate() {
-            let primary = txn.fields(recipient).peer_response.unwrap();
-            assert_eq!(primary.content.unwrap().len(), 256);
-            assert_eq!(primary.content_truncated, marker);
-        }
+        let accepted = txn.fields(1);
+        assert!(accepted.peer_response.is_none());
+        assert!(accepted.failure_kind.is_none());
+        assert_eq!(accepted.peer_replies.len(), MAX_REPLIES);
+        assert_eq!(accepted.peer_replies_omitted, Some(1));
+
+        // Removing the second "busy" must leave the first one ahead of "try later".
+        let retained = txn.fields(3);
+        assert_eq!(
+            retained.peer_response.unwrap().content.as_deref(),
+            Some("busy")
+        );
+        assert_eq!(retained.peer_replies[0], accepted.peer_replies[0]);
+        let omitted = txn.fields(responses.len() - 1);
+        assert_eq!(
+            omitted.peer_response,
+            Some(SmtpPeerResponse::new(450, busy.enhanced_code))
+        );
+        assert_eq!(omitted.peer_replies, accepted.peer_replies);
+        assert!(omitted.peer_replies_omitted.is_none());
+        assert_eq!(omitted.smtp_stage.unwrap().as_str(), "rcpt_to");
+        assert_eq!(omitted.failure_kind.unwrap().as_str(), "smtp_reply");
+        assert_eq!(omitted.transaction_number, accepted.transaction_number);
     }
 
     #[tokio::test]
-    async fn mixed_recipients_keep_their_own_primary_reply_across_payload_limit() {
+    async fn mixed_recipients_share_a_global_final_dot_refusal() {
         let socket = socket();
-        socket.mark_ready(None);
-        socket.observe(SmtpObservation::MailFromStarted);
-        for _ in 0..MAX_REPLIES {
-            negative(&socket, SmtpStage::RcptTo, 450);
-        }
-        negative(&socket, SmtpStage::RcptTo, 551);
-        finish(&socket, SmtpStage::DataDot, None);
-        let report = socket
-            .delivery(&[reply(250), reply(551)], false, None)
-            .await;
-        let accepted = to_value(report.fields(0)).unwrap();
-        let refused = to_value(report.fields(1)).unwrap();
-        assert!(accepted.get("peer_response").is_none());
-        assert!(accepted.get("failure_kind").is_none());
-        assert_eq!(accepted["peer_replies_omitted"], 1);
-        assert_eq!(refused["failure_kind"], "smtp_reply");
-        assert_eq!(refused["smtp_stage"], "rcpt_to");
-        assert_eq!(refused["peer_response"]["code"], 551);
-        assert_eq!(
-            refused["peer_replies"].as_array().unwrap().len(),
-            MAX_REPLIES
+        negative(&socket, SmtpStage::RcptTo, 450);
+        negative(&socket, SmtpStage::DataDot, 550);
+        finish(
+            &socket,
+            SmtpStage::DataDot,
+            Some(SmtpFailureKind::SmtpReply),
         );
-        assert!(refused.get("peer_replies_omitted").is_none());
-        assert_eq!(
-            refused["transaction_number"],
-            accepted["transaction_number"]
-        );
+        // Native Rejected (not RejectedBatch) repeats the final dot for both recipients.
+        let responses = [reply(550), reply(550)];
+        let txn = socket.delivery(&responses, false, None).await;
+        let fields = txn.fields(0);
+        assert_eq!(fields, txn.fields(1));
+        assert_eq!(fields.smtp_stage.unwrap().as_str(), "data_dot");
+        assert_eq!(fields.peer_response.unwrap().code, 550);
+        assert_eq!(fields.peer_replies.len(), 1);
+        assert_eq!(fields.peer_replies[0].smtp_stage.as_str(), "rcpt_to");
+        assert_eq!(fields.peer_replies[0].response.code, 450);
     }
 
     #[tokio::test]
     async fn address_list_stats_for_mixed_mx_list() {
+        use crate::smtp_dispatcher::MxListEntry;
         use dns_resolver::{IpLookupStrategy, TestResolver};
 
         let resolver = TestResolver::default().with_bogus("broken.example.");

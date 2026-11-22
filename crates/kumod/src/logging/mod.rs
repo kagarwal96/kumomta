@@ -351,29 +351,19 @@ impl Logger {
                 }
             }
             LoggerImpl::Queue { sender, .. } => {
-                self.enqueue(sender, LogCommand::Record(record, msg)).await
+                match sender.try_send(LogCommand::Record(record, msg)) {
+                    Ok(()) => Ok(()),
+                    Err(TrySendError::Full(record)) => {
+                        SUBMIT_FULL
+                            .get_metric_with_label_values(&[&self.name])
+                            .expect("get counter")
+                            .inc();
+                        sender.send_async(record).await?;
+                        Ok(())
+                    }
+                    Err(TrySendError::Disconnected(_)) => anyhow::bail!("log channel was closed"),
+                }
             }
-        }
-    }
-
-    async fn enqueue(
-        &self,
-        sender: &Sender<LogCommand>,
-        command: LogCommand,
-    ) -> anyhow::Result<()> {
-        match sender.try_send(command) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(command)) => {
-                SUBMIT_FULL
-                    .get_metric_with_label_values(&[&self.name])
-                    .expect("get counter")
-                    .inc();
-                sender
-                    .send_async(command)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("log channel was closed"))
-            }
-            Err(TrySendError::Disconnected(_)) => anyhow::bail!("log channel was closed"),
         }
     }
 

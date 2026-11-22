@@ -530,11 +530,6 @@ pub fn materialize_to_lua_value(lua: &Lua, value: mlua::Value) -> mlua::Result<m
         }
         mlua::Value::Table(t) => {
             let tbl = lua.create_table()?;
-            // Serde marks arrays so an empty sequence remains [] rather than {}.
-            // Materialize plain data; don't copy arbitrary Lua metamethods.
-            if let Some(mt) = t.metatable().filter(|mt| *mt == lua.array_metatable()) {
-                tbl.set_metatable(Some(mt))?;
-            }
             for pair in t.pairs::<mlua::Value, mlua::Value>() {
                 let (k, v) = pair?;
                 tbl.set(k.clone(), materialize_to_lua_value(lua, v)?)?;

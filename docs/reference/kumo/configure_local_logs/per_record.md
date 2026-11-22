@@ -109,5 +109,7 @@ kumo.configure_local_logs {
 
 Without a `slow_threshold` (the default), the logger writes only empty address lists, failed attempts, and attempts with a negative peer reply, even if setup recovers. A threshold also selects an individual attempt or address-list build that took at least that long. It does not add durations across attempts. Reusing a connection does not generate a setup record.
 
+A local file logger discards a `SmtpConnection` record if its queue is full or closed, rather than delaying the next SMTP attempt or transaction. Each discarded submission increments [log_smtp_connection_dropped_total](../../metrics/kumod/log_smtp_connection_dropped_total.md) for that logger. Message dispositions still wait for queue capacity.
+
 The record's own `template`, `suffix`, `log_dir` and `segment_header` apply. Message headers, metadata and the message-based `filter_event` do not apply. Neither logging hook accepts `SmtpConnection`.
 

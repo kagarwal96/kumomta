@@ -1,12 +1,19 @@
 //! SMTP diagnostics for local file loggers.
 use super::{LogCommand, LogRecordParams, LoggerImpl, LOGGER};
 use chrono::Utc;
+use flume::Sender;
 use kumo_log_types::smtp::{SmtpConnectionEvent, SmtpConnectionRecord, SmtpDispositionFields};
 use kumo_log_types::{RecordType, ResolvedAddress};
+use kumo_prometheus::declare_metric;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+declare_metric! {
+/// SMTP connection records discarded because the local file logger queue was full or closed.
+static CONNECTION_DROPPED: IntCounterVec("log_smtp_connection_dropped_total", &["logger"]);
+}
 
 pub(super) fn validate_config(
     per_record: &HashMap<RecordType, LogRecordParams>,
@@ -50,7 +57,7 @@ impl ConnectionLog {
 }
 
 /// Emit one message-independent record to each interested local file logger.
-pub(crate) async fn log_smtp_connection(
+pub(crate) fn log_smtp_connection(
     session_id: Uuid,
     egress_source: &str,
     event: SmtpConnectionEvent,
@@ -80,13 +87,18 @@ pub(crate) async fn log_smtp_connection(
     for logger in loggers {
         if let LoggerImpl::Queue { sender, .. } = &logger.implementation {
             let _timer = logger.submit_latency.start_timer();
-            if let Err(err) = logger
-                .enqueue(sender, LogCommand::SmtpConnection(record.clone()))
-                .await
-            {
-                tracing::error!("failed to enqueue SMTP connection record: {err:#}");
-            }
+            try_submit_connection(sender, &logger.name, Arc::clone(&record));
         }
+    }
+}
+
+fn try_submit_connection(
+    sender: &Sender<LogCommand>,
+    logger: &str,
+    record: Arc<SmtpConnectionRecord>,
+) {
+    if sender.try_send(LogCommand::SmtpConnection(record)).is_err() {
+        CONNECTION_DROPPED.with_label_values(&[logger]).inc();
     }
 }
 
@@ -155,6 +167,38 @@ mod test {
         assert!(!selection.should_log(false, Some(Duration::from_secs(1))));
         assert!(!selection.should_log(false, None));
         assert!(selection.should_log(true, None));
+    }
+
+    #[test]
+    fn full_logger_drops_connection_record_without_waiting() {
+        let (sender, receiver) = flume::bounded(1);
+        sender.try_send(LogCommand::Terminate).unwrap();
+        let logger = "dir-test-full-connection-queue";
+        let dropped = CONNECTION_DROPPED.with_label_values(&[logger]);
+        let before = dropped.get();
+        let record = SmtpConnectionRecord::new(
+            Utc::now(),
+            Uuid::nil(),
+            "test",
+            SmtpConnectionEvent::AddressList {
+                outcome: "no_address".into(),
+                usable_ip_candidates: 0,
+                address_list_build_ms: None,
+            },
+        );
+
+        let (done, finished) = flume::bounded(1);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                try_submit_connection(&sender, logger, Arc::new(record));
+                done.send(()).unwrap();
+            });
+            // Keep the queue full until submission returns. On timeout, release a blocked sender.
+            let result = finished.recv_timeout(Duration::from_secs(5));
+            drop(receiver);
+            result.expect("SMTP connection logging waited for queue capacity");
+        });
+        assert_eq!(dropped.get(), before + 1);
     }
 
     #[test]

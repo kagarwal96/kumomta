@@ -13,6 +13,21 @@ fn telemetry_options(mode: &str) -> DaemonWithMaildirOptions {
     DaemonWithMaildirOptions::new().env("KUMOD_TEST_SMTP_TELEMETRY", mode)
 }
 
+// Called after stop_both(), when the source has finished writing its segments.
+fn closed_connection_records(daemon: &DaemonWithMaildir) -> anyhow::Result<Vec<Value>> {
+    let mut records = Vec::new();
+    for entry in std::fs::read_dir(daemon.source.dir.path().join("connections"))? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            let data = zstd::stream::decode_all(std::fs::File::open(entry.path())?)?;
+            for line in std::str::from_utf8(&data)?.lines() {
+                records.push(serde_json::from_str(line)?);
+            }
+        }
+    }
+    Ok(records)
+}
+
 #[tokio::test]
 async fn mx_failover() -> anyhow::Result<()> {
     let mut daemon = telemetry_options("1").start().await?;
@@ -49,7 +64,7 @@ async fn mx_failover() -> anyhow::Result<()> {
     daemon.stop_both().await?;
 
     // The failed endpoint gets a connection record; the clean backup appears only in Delivery.
-    let records: Vec<Value> = daemon.source.read_log_records("connections").await?;
+    let records = closed_connection_records(&daemon)?;
     let [attempt] = records.as_slice() else {
         anyhow::bail!("expected only the failed attempt, got {records:?}")
     };
@@ -163,7 +178,7 @@ async fn auth_refusal_logs_peer_text_not_client_credentials() -> anyhow::Result<
     assert_peer_refusals(&daemon, &[(["sink", "535", "auth_failed"], 1.0)]).await?;
     daemon.stop_both().await?;
 
-    let records: Vec<Value> = daemon.source.read_log_records("connections").await?;
+    let records = closed_connection_records(&daemon)?;
     let [attempt] = records.as_slice() else {
         anyhow::bail!("expected one failed AUTH attempt, got {records:?}");
     };
@@ -224,6 +239,11 @@ async fn pipelined_refusals_on_reused_connection() -> anyhow::Result<()> {
     )
     .await?;
     assert_eq!(builds, ["complete"]);
+    let plan_groups = metric_samples(&daemon, "smtp_client_plan_attempts", |m| {
+        m.labels()["destination_relay_group"].to_string()
+    })
+    .await?;
+    assert_eq!(plan_groups, ["sink"]); // the skipped IPv6 backup is not in the plan
     let mut uses = metric_samples(&daemon, "smtp_client_transactions_total", |m| {
         (m.labels()["connection_use"].to_string(), m.value())
     })
@@ -233,7 +253,7 @@ async fn pipelined_refusals_on_reused_connection() -> anyhow::Result<()> {
     daemon.stop_both().await?;
 
     // The zero threshold selects both the localhost lookup and its ready socket without a delay.
-    let connections: Vec<Value> = daemon.source.read_log_records("connections").await?;
+    let connections = closed_connection_records(&daemon)?;
     let ready = connections
         .iter()
         .find(|r| r["event"] == "attempt" && r["outcome"] == "smtp_ready")

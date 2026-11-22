@@ -408,7 +408,9 @@ async fn classify(group: &str, stage: SmtpStage, input: ClassifierInput) -> Clas
                 (group, stage.as_str(), SerdeWrappedValue(input)),
             )
             .await;
-        lua.put();
+        if result.is_ok() {
+            lua.put();
+        }
         // Lua errors can contain the peer's original text. Never propagate or log them.
         result.ok().flatten()
     };

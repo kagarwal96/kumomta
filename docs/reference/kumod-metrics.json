@@ -517,6 +517,17 @@
     "pruning": "NonPruning"
   },
   {
+    "name": "log_smtp_connection_dropped_total",
+    "help": "SMTP connection records discarded because the local file logger queue was full or closed.",
+    "doc": null,
+    "metric_type": "Counter",
+    "label_names": [
+      "logger"
+    ],
+    "buckets": [],
+    "pruning": "NonPruning"
+  },
+  {
     "name": "log_submit_full",
     "help": "how many times submission of a log event hit the back_pressure",
     "doc": null,

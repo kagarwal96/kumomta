@@ -337,6 +337,11 @@ kumo.on('get_queue_config', function(domain, tenant, campaign, routing_domain)
     },
   }
 
+  if SMTP_TELEMETRY == 'classify' then
+    -- skip_hosts excludes this IPv6 candidate; it must not affect the plan's provider.
+    table.insert(protocol.smtp.mx_list, { name = 'skipped', addr = '[::1]:' .. SINK_PORT })
+  end
+
   if domain == 'two-hosts.example.com' then
     protocol = {
       -- Redirect traffic to the sink, but with two hosts in the connection plan
