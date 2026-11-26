@@ -26,6 +26,8 @@ pub use openssl;
 pub use tokio_rustls;
 
 const MAX_LINE_LEN: usize = 4096;
+// The line reader can already accept a single line spanning two full reads.
+const MAX_REPLY_SIZE: usize = 8 * 1024;
 
 #[derive(Error, Debug, Clone)]
 pub enum ClientError {
@@ -35,6 +37,8 @@ pub enum ClientError {
     MalformedResponseLine(String),
     #[error("Response line is too long")]
     ResponseTooLong,
+    #[error("SMTP reply exceeds {MAX_REPLY_SIZE} wire bytes")]
+    ReplyTooLong,
     #[error("Not connected")]
     NotConnected,
     #[error("Command rejected {0:?}")]
@@ -126,6 +130,7 @@ impl ClientError {
             Self::Utf8(_)
             | Self::MalformedResponseLine(_)
             | Self::ResponseTooLong
+            | Self::ReplyTooLong
             | Self::NotConnected
             | Self::InvalidDnsName(_)
             | Self::FailedToBuildConnector { .. }
@@ -303,19 +308,46 @@ impl SmtpClient {
         &self.timeouts
     }
 
+    fn abort_reply(&mut self, err: ClientError) -> ClientError {
+        self.socket.take();
+        self.read_buffer.clear();
+        if let Some(tracer) = &self.tracer {
+            tracer.trace_event(SmtpClientTraceEvent::Diagnostic {
+                level: Level::ERROR,
+                message: err.to_string(),
+            });
+            tracer.trace_event(SmtpClientTraceEvent::Closed);
+        }
+        err
+    }
+
     async fn read_line(
         &mut self,
-        timeout_duration: Duration,
+        deadline: Option<Instant>,
         cmd: Option<&Command>,
+        remaining: &mut usize,
     ) -> Result<String, ClientError> {
+        // None is a nonblocking liveness probe, not an expired command.
+        let start = Instant::now();
+        let expires = deadline.unwrap_or(start);
         let mut too_long = false;
         loop {
+            // timeout_at may return ready I/O even after its deadline. Check
+            // before consuming buffered data as well as when waiting for I/O.
+            if deadline.is_some() && Instant::now() >= expires {
+                break;
+            }
             let mut iter = self.read_buffer.iter().enumerate();
             while let Some((i, &b)) = iter.next() {
                 if b != b'\r' {
                     continue;
                 }
                 if let Some((_, b'\n')) = iter.next() {
+                    // Leave any bytes after this CRLF for the next line or reply.
+                    if i + 2 > *remaining {
+                        return Err(self.abort_reply(ClientError::ReplyTooLong));
+                    }
+                    *remaining -= i + 2;
                     if too_long {
                         self.read_buffer.drain(0..i + 2);
 
@@ -334,7 +366,12 @@ impl SmtpClient {
                     return Ok(line?);
                 }
             }
+            if self.read_buffer.len() >= *remaining {
+                // No complete line can still fit in this reply's wire budget.
+                return Err(self.abort_reply(ClientError::ReplyTooLong));
+            }
             if self.read_buffer.len() > MAX_LINE_LEN {
+                *remaining -= self.read_buffer.len();
                 self.read_buffer.clear();
                 too_long = true;
             }
@@ -342,7 +379,7 @@ impl SmtpClient {
             // Didn't find a complete line, fill up the rest of the buffer
             let mut data = [0u8; MAX_LINE_LEN];
             let size = match self.socket.as_mut() {
-                Some(s) => match timeout(timeout_duration, s.read(&mut data)).await {
+                Some(s) => match timeout_at(expires, s.read(&mut data)).await {
                     Ok(Ok(size)) => size,
                     Ok(Err(err)) => {
                         self.socket.take();
@@ -359,28 +396,7 @@ impl SmtpClient {
                             partial: String::from_utf8_lossy(&self.read_buffer).to_string(),
                         });
                     }
-                    Err(_) => {
-                        // If we're using a zero timeout we're probing
-                        // for liveness, so we don't want to treat this
-                        // timeout as a fatal error that closes the
-                        // connection
-                        if timeout_duration != Duration::ZERO {
-                            self.socket.take();
-                        }
-                        if let Some(tracer) = &self.tracer {
-                            tracer.trace_event(SmtpClientTraceEvent::Diagnostic {
-                                level: Level::ERROR,
-                                message: format!("Read Timeout after {timeout_duration:?}"),
-                            });
-                            if self.socket.is_none() {
-                                tracer.trace_event(SmtpClientTraceEvent::Closed);
-                            }
-                        }
-                        return Err(ClientError::TimeOutResponse {
-                            command: cmd.cloned(),
-                            duration: timeout_duration,
-                        });
-                    }
+                    Err(_) => break,
                 },
                 None => {
                     return Err(ClientError::ReadError {
@@ -408,6 +424,16 @@ impl SmtpClient {
             }
             self.read_buffer.extend_from_slice(&data[0..size]);
         }
+
+        let err = ClientError::TimeOutResponse {
+            command: cmd.cloned(),
+            duration: expires.saturating_duration_since(start),
+        };
+        if deadline.is_none() && *remaining == MAX_REPLY_SIZE && self.read_buffer.is_empty() {
+            Err(err) // An idle probe has not consumed any of a reply.
+        } else {
+            Err(self.abort_reply(err))
+        }
     }
 
     /// Check to see if there is either a unilateral response
@@ -418,11 +444,11 @@ impl SmtpClient {
     /// by sending what should be a 421, or abruptly by simply snipping
     /// the connection.
     pub async fn check_unilateral_response(&mut self) -> Result<Option<Response>, ClientError> {
-        match self.read_response(None, Duration::ZERO).await {
+        match self.read_response_inner(None, None).await {
             // Unilateral response was received
             Ok(response) => Ok(Some(response)),
             // Nothing immediately available: this should hopefully be the common case
-            Err(ClientError::TimeOutResponse { .. }) => Ok(None),
+            Err(ClientError::TimeOutResponse { .. }) if self.is_connected() => Ok(None),
             // An actual error
             Err(err) => Err(err),
         }
@@ -433,6 +459,16 @@ impl SmtpClient {
         command: Option<&Command>,
         timeout_duration: Duration,
     ) -> Result<Response, ClientError> {
+        self.read_response_inner(command, Some(timeout_duration))
+            .await
+    }
+
+    async fn read_response_inner(
+        &mut self,
+        command: Option<&Command>,
+        timeout: Option<Duration>,
+    ) -> Result<Response, ClientError> {
+        let timeout_duration = timeout.unwrap_or_default();
         let deadline = Instant::now() + timeout_duration;
 
         if let Some(sock) = self.socket.as_mut() {
@@ -452,33 +488,27 @@ impl SmtpClient {
                     });
                 }
                 Err(_elapsed) => {
-                    self.socket.take();
-                    if let Some(tracer) = &self.tracer {
-                        tracer.trace_event(SmtpClientTraceEvent::Diagnostic {
-                            level: Level::ERROR,
-                            message: format!("Flush timed out after {timeout_duration:?}"),
-                        });
-                        tracer.trace_event(SmtpClientTraceEvent::Closed);
-                    }
-                    return Err(ClientError::TimeOutResponse {
+                    return Err(self.abort_reply(ClientError::TimeOutResponse {
                         command: command.cloned(),
                         duration: timeout_duration,
-                    });
+                    }));
                 }
             }
         }
 
-        let mut line = self
-            .read_line(deadline.saturating_duration_since(Instant::now()), command)
-            .await?;
+        let deadline = timeout.map(|_| deadline);
+        let mut remaining = MAX_REPLY_SIZE;
+        let mut line = self.read_line(deadline, command, &mut remaining).await?;
         tracing::trace!("recv<-{}: {line}", self.hostname);
         let mut parsed = parse_response_line(&line)?;
         let mut response_builder = ResponseBuilder::new(&parsed);
 
         while !parsed.is_final {
-            let per_line =
-                Duration::from_secs(60).min(deadline.saturating_duration_since(Instant::now()));
-            line = self.read_line(per_line, command).await?;
+            let line_deadline =
+                deadline.map(|end| end.min(Instant::now() + Duration::from_secs(60)));
+            line = self
+                .read_line(line_deadline, command, &mut remaining)
+                .await?;
             parsed = parse_response_line(&line)?;
             response_builder
                 .add_line(&parsed)
@@ -1324,6 +1354,145 @@ mod test {
         panic!("{resp:#?}");
     }
     */
+
+    fn client_pair() -> (SmtpClient, tokio::net::UnixStream) {
+        let (socket, peer) = tokio::net::UnixStream::pair().unwrap();
+        (
+            SmtpClient::with_stream(socket, "localhost", SmtpClientTimeouts::default()),
+            peer,
+        )
+    }
+
+    #[tokio::test]
+    async fn reply_budget_counts_framing_but_not_the_next_reply() {
+        for extra in [0, 1] {
+            let (mut client, mut peer) = client_pair();
+            // Split the final CRLF across reads. The next reply is already in flight.
+            let first = format!("250-{}\r\n", "x".repeat(MAX_LINE_LEN - 6));
+            let last = format!(
+                "250 {}\r",
+                "y".repeat(MAX_REPLY_SIZE + extra - first.len() - 6)
+            );
+            client.read_buffer = [first.as_bytes(), last.as_bytes()].concat();
+            peer.write_all(b"\n221 bye\r\n").await.unwrap();
+            let budget = Duration::from_secs(1);
+            let result = client.read_response(None, budget).await;
+            if extra == 0 {
+                assert_eq!(result.unwrap().code, 250);
+                assert_eq!(client.read_response(None, budget).await.unwrap().code, 221);
+            } else {
+                assert!(matches!(result, Err(ClientError::ReplyTooLong)));
+                assert!(!client.is_connected());
+                assert!(client.read_buffer.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn largest_previously_accepted_single_line_still_fits() {
+        let (mut client, mut peer) = client_pair();
+        let line = format!("250 {}\r\n", "x".repeat(2 * MAX_LINE_LEN - 6));
+        client
+            .read_buffer
+            .extend_from_slice(&line.as_bytes()[..MAX_LINE_LEN]);
+        peer.write_all(&line.as_bytes()[MAX_LINE_LEN..])
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .read_response(None, Duration::from_secs(1))
+                .await
+                .unwrap()
+                .content
+                .len(),
+            line.len() - 6
+        );
+    }
+
+    #[tokio::test]
+    async fn discarded_line_bytes_count_towards_the_reply_limit() {
+        let (mut client, mut peer) = client_pair();
+        client.read_buffer = vec![b'x'; MAX_LINE_LEN + 1];
+        let tail = format!("{}\r\n", "x".repeat(MAX_REPLY_SIZE - MAX_LINE_LEN - 2));
+        peer.write_all(tail.as_bytes()).await.unwrap();
+        assert!(matches!(
+            client.read_response(None, Duration::from_secs(1)).await,
+            Err(ClientError::ReplyTooLong)
+        ));
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_reads_share_the_whole_reply_deadline() {
+        let (mut client, mut peer) = client_pair();
+        let budget = Duration::from_secs(10);
+        let start = Instant::now();
+        let (result, ()) =
+            tokio::join!(client.read_response(Some(&Command::Data), budget), async {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                peer.write_all(b"354-continue\r\n").await.unwrap();
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                peer.write_all(b"354 ").await.unwrap();
+            });
+        assert!(matches!(
+            result,
+            Err(ClientError::TimeOutResponse {
+                command: Some(Command::Data),
+                ..
+            })
+        ));
+        assert_eq!(start.elapsed(), budget);
+        assert!(!client.is_connected());
+        assert!(client.read_buffer.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuation_line_keeps_its_shorter_deadline() {
+        let (mut client, _peer) = client_pair();
+        client.read_buffer.extend_from_slice(b"250-first\r\n");
+        let start = Instant::now();
+        assert!(matches!(
+            client.read_response(None, Duration::from_secs(300)).await,
+            Err(ClientError::TimeOutResponse { .. })
+        ));
+        assert_eq!(start.elapsed(), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn expired_command_deadline_rejects_an_already_buffered_reply() {
+        let (mut client, _peer) = client_pair();
+        client.read_buffer.extend_from_slice(b"250 OK\r\n");
+        assert!(matches!(
+            client.read_response(None, Duration::ZERO).await,
+            Err(ClientError::TimeOutResponse { .. })
+        ));
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn idle_probe_only_keeps_an_empty_or_complete_reply() {
+        let (mut client, _peer) = client_pair();
+        assert!(client.check_unilateral_response().await.unwrap().is_none());
+        client.read_buffer.extend_from_slice(b"421 bye\r\n");
+        assert_eq!(
+            client
+                .check_unilateral_response()
+                .await
+                .unwrap()
+                .unwrap()
+                .code,
+            421
+        );
+        for partial in [&b"421 "[..], &b"421-first\r\n"[..]] {
+            let (mut client, _peer) = client_pair();
+            client.read_buffer.extend_from_slice(partial);
+            assert!(matches!(
+                client.check_unilateral_response().await,
+                Err(ClientError::TimeOutResponse { .. })
+            ));
+            assert!(!client.is_connected());
+        }
+    }
 
     #[test]
     fn response_line_parsing() {

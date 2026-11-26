@@ -16,7 +16,7 @@ CONFLICTS=kumomta
 
 DEB_ARCH=$(dpkg-architecture -q DEB_BUILD_ARCH_CPU)
 
-KUMO_DEB_VERSION=$(git -c "core.abbrev=8" show -s "--format=%cd.%h" "--date=format:%Y.%m.%d.%H%M%S")
+KUMO_DEB_VERSION=${KUMO_DEB_VERSION:-$(git -c "core.abbrev=8" show -s "--format=%cd.%h" "--date=format:%Y.%m.%d.%H%M%S")}
 distro=$(lsb_release -is 2>/dev/null || sh -c "source /etc/os-release && echo \$NAME")
 distver=$(lsb_release -rs 2>/dev/null || sh -c "source /etc/os-release && echo \$VERSION_ID")
 export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)

@@ -544,6 +544,9 @@ impl Opt {
                         if !self.keep_going {
                             return Err(err);
                         }
+                        if matches!(&client, Client::Smtp(smtp) if !smtp.is_connected()) {
+                            continue 'reconnect;
+                        }
                     }
                 };
             }
@@ -551,6 +554,58 @@ impl Opt {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn keep_going_counts_a_failed_send_and_reconnects() -> anyhow::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let mut opts = Opt::try_parse_from([
+        "traffic-gen",
+        "--target",
+        &listener.local_addr()?.to_string(),
+        "--keep-going",
+        "--domain-suffix",
+        "example.invalid",
+        "--throttle",
+        "local:10/s",
+    ])?;
+    opts.compute_domain_weights();
+    opts.body_file_content
+        .set("Subject: fixture\r\n\r\nhello\r\n".to_string())
+        .unwrap();
+    let sent = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+    let latency = Histogram::new(3)?.into_sync();
+    let worker = opts.run(Arc::clone(&sent), Arc::clone(&failed), latency.recorder());
+
+    let reconnect = async {
+        let mut first = BufReader::new(listener.accept().await?.0);
+        for (reply, command) in [
+            ("220 fixture\r\n", "EHLO "),
+            ("250 fixture\r\n", "MAIL FROM:"),
+        ] {
+            first.get_mut().write_all(reply.as_bytes()).await?;
+            let mut line = String::new();
+            first.read_line(&mut line).await?;
+            assert!(
+                line.starts_with(command),
+                "expected {command}, got {line:?}"
+            );
+        }
+        drop(first); // Fail the send after connection setup succeeded.
+        listener.accept().await
+    };
+    tokio::select! {
+        retry = tokio::time::timeout(Duration::from_secs(5), reconnect) => { retry??; }
+        result = worker => anyhow::bail!("worker stopped before reconnecting: {result:?}"),
+    }
+    assert_eq!(sent.load(Ordering::SeqCst), 0);
+    assert_eq!(failed.load(Ordering::SeqCst), 1);
+    Ok(())
 }
 
 #[tokio::main]
