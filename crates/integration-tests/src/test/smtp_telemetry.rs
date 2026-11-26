@@ -218,14 +218,12 @@ async fn pipelined_refusals_on_reused_connection() -> anyhow::Result<()> {
     });
     submit_for_transient_failures(&daemon, &messages, Duration::from_secs(50)).await?;
 
-    // Both 450 replies increment the same counter, despite distinct enhanced codes.
-    // Each pipelined DATA refusal still counts when the classifier throws.
+    // Recipient outcomes count, while consequential pipelined DATA refusals do not.
     assert_peer_refusals(
         &daemon,
         &[
             (["sink", "450", "temporary"], 2.0),
             (["sink", "452", "other"], 1.0),
-            (["sink", "503", "other"], 3.0),
         ],
     )
     .await?;

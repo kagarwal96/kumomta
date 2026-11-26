@@ -63,7 +63,7 @@ declare_metric! {
 static PER_CONNECTION: HistogramVec("smtp_client_transactions_per_connection", &["destination_relay_group", "measure"], TRANSACTIONS.to_vec());
 }
 declare_metric! {
-/// Negative replies read from the SMTP peer, counted before disposition policy.
+/// Final peer refusals per recipient, before disposition policy; setup replies count once.
 ///
 /// `smtp_code` is the peer's numeric reply code (400–599). For provider and reason
 /// labels, see [kumo.configure_smtp_client_telemetry](../../kumo/configure_smtp_client_telemetry.md).
@@ -361,25 +361,33 @@ static CLASSIFY_REPLY: Single(
 }
 
 impl Policy {
-    fn count_refusal(&self, provider: &str, code: u16, reason: Option<&str>) -> &str {
-        let reason = reason
+    fn reason(&self, reason: Option<&str>) -> &str {
+        reason
             .and_then(|s| self.reasons.get(s))
-            .map_or("other", String::as_str);
+            .map_or("other", String::as_str)
+    }
+
+    fn count_refusal(&self, provider: &str, code: u16, reason: Option<&str>) {
+        let reason = self.reason(reason);
         REFUSALS
             .with_label_values(&[self.bounded_group(provider), &code.to_string(), reason])
             .inc();
-        reason
+    }
+}
+
+/// Count a classified peer refusal. Only call for a peer reply, never a local error.
+pub fn count_peer_refusal(provider: &str, code: u16, reason: Option<&str>) {
+    if let Some(policy) = POLICY.get() {
+        if (400..600).contains(&code) {
+            policy.count_refusal(provider, code, reason);
+        }
     }
 }
 
 /// Used when the observer cannot retain another reply for async classification.
-/// Only call for a complete peer reply, in lieu of `peer_reply`, never for a local error.
+/// Only call for a complete peer reply, never for a local error.
 pub fn peer_reply_unclassified(provider: &str, code: u16) {
-    if let Some(policy) = POLICY.get() {
-        if (400..600).contains(&code) {
-            policy.count_refusal(provider, code, None);
-        }
-    }
+    count_peer_refusal(provider, code, None);
 }
 
 fn classifier_input(stage: SmtpStage, response: &Response, truncated: bool) -> ClassifierInput {
@@ -421,8 +429,8 @@ async fn classify(group: &str, stage: SmtpStage, input: ClassifierInput) -> Clas
         .unwrap_or_default()
 }
 
-/// Count one observed negative reply and return its bounded reason.
-pub async fn peer_reply(
+/// Classify one negative peer reply and return its bounded reason.
+pub async fn classify_peer_reply(
     provider: &str,
     stage: SmtpStage,
     response: &Response,
@@ -434,7 +442,5 @@ pub async fn peer_reply(
     }
     let input = classifier_input(stage, response, truncated);
     let classified = classify(policy.bounded_group(provider), stage, input).await;
-    // There is no await between counting and returning. The dispatcher's pending
-    // reply guard owns the unclassified increment if this future is cancelled.
-    Some(policy.count_refusal(provider, response.code, classified.reason.as_deref()))
+    Some(policy.reason(classified.reason.as_deref()))
 }
